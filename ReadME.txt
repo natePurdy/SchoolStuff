@@ -1,0 +1,2 @@
+just run the python script like: "python hw1_imageProcessingBasics.py" from the command line or powershell, 
+should work on either linux or windows (i tried them both, please contact me if it does not...)
