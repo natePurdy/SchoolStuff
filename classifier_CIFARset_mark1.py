@@ -11,15 +11,46 @@ import torch.optim as optim
 from tqdm import tqdm
 import sys
 import pandas as pd
+import torchvision.transforms as T
+from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
+import seaborn as sns
 
 
 # some important high level parameters...
-numEpochs = 30
+numEpochs = 50
 learningRate = 0.001
 batch_size = 16
 image_size = (32, 32)   # 32x32 colour image
 augmentTrainData = True
-testName = "basicDeeperTest"
+testName = "deeperCNN_moreAugmentations"
+GO_DEEP = True
+
+
+# function to cut holes out or images randomly
+def cutout(img, mask_size=8, rng=None):
+    """
+    img: numpy array, shape (C,H,W) float32 0..1
+    mask_size: size of square hole
+    rng: np.random.Generator for reproducibility
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    
+    _, H, W = img.shape
+
+    # random center
+    y = rng.randint(0, H)
+    x = rng.randint(0, W)
+
+    # compute bounds of the square
+    y1 = np.clip(y - mask_size // 2, 0, H)
+    y2 = np.clip(y + mask_size // 2, 0, H)
+    x1 = np.clip(x - mask_size // 2, 0, W)
+    x2 = np.clip(x + mask_size // 2, 0, W)
+
+    img[:, y1:y2, x1:x2] = 0.0  # black hole
+    return img
 
 
 # model is defined here
@@ -70,6 +101,7 @@ class DeeperCNN(nn.Module):
         super().__init__()
         
         self.features = nn.Sequential(
+
             # Block 1
             nn.Conv2d(3, 32, 3, padding=1),
             nn.BatchNorm2d(32),
@@ -107,7 +139,7 @@ class DeeperCNN(nn.Module):
             nn.Dropout(0.4),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2),
             nn.Linear(128, num_classes)
         )
 
@@ -135,16 +167,48 @@ class CIFARDataset(Dataset):
 
     def __len__(self):
         return len(self.y)
-
     def __getitem__(self, idx):
-        img = self.X[idx].astype(np.float32) / 255.0
+        img = self.X[idx]  # (C,H,W)
         label = self.y[idx]
 
-        # simple augmentation (horizontal flip)
-        if self.augment and self.rngForAugs.rand() > 0.5:
+        # Convert to PIL Image for augmentation
+        img = np.transpose(img, (1, 2, 0))  # (H,W,C)
+        img = (img).astype(np.uint8)
+        img = Image.fromarray(img)
 
-            img = img[:, :, ::-1].copy()  # flip width axis
-            # perform more complicated augmentations here if you want to get better performance
+        if self.augment:
+            # --- Horizontal flip ---
+            if self.rngForAugs.random() > 0.5:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+            # --- Random crop with padding ---
+            img = ImageOps.expand(img, border=4, fill=0)  # pad 4 pixels
+            left = self.rngForAugs.randint(0, 9)
+            top  = self.rngForAugs.randint(0, 9)
+            img = img.crop((left, top, left+32, top+32))
+
+            # --- Color jitter ---
+            factor = 0.8 + self.rngForAugs.random() * 0.4  # brightness
+            img = ImageEnhance.Brightness(img).enhance(factor)
+            factor = 0.8 + self.rngForAugs.random() * 0.4  # contrast
+            img = ImageEnhance.Contrast(img).enhance(factor)
+            factor = 0.8 + self.rngForAugs.random() * 0.4  # saturation
+            img = ImageEnhance.Color(img).enhance(factor)
+
+            # --- Convert to NumPy for Cutout ---
+            img = np.array(img, dtype=np.float32) 
+            img = np.transpose(img, (2, 0, 1))  # (C,H,W)
+
+
+            if self.rngForAugs.random() > 0.5: # cut holes randomly from half of the images
+                # --- Apply Cutout ---
+                mask_size = 3  # size of hole
+                img = cutout(img, mask_size=mask_size, rng=self.rngForAugs)
+
+        else:
+            # If not augmenting, just normalize to [0,1] and convert to (C,H,W)
+            img = np.array(img, dtype=np.float32) 
+            img = np.transpose(img, (2, 0, 1))
 
         return torch.from_numpy(img), torch.tensor(label, dtype=torch.long)
 
@@ -260,7 +324,11 @@ class_id_to_name = {
 # print(class_id_to_name)
 
 # okay now we have training data and labels.... SET UP THE MODEL!!!
-model = DeeperCNN().to(device) 
+if GO_DEEP == True:
+    model = DeeperCNN().to(device) 
+else:
+    model = CNN().to(device) 
+
 criterion = nn.CrossEntropyLoss() # for binary classification (ex: dog or cat)
 optimizer = optim.Adam(model.parameters(), lr=learningRate) # seems okay
 
@@ -387,10 +455,10 @@ history_df.to_csv(f"CIFAR_classifierMark1_{testName}_{numEpochs}epochs_{np.round
 # -------------------------------
 # --- Confusion Matrix ---
 # -------------------------------
-conf_matrix = np.zeros((num_classes,num_classes), dtype=int)
+conf_matrix = np.zeros((10,10), dtype=int)
 for t, p in zip(labels_all, preds_all):
     conf_matrix[t, p] += 1
-
+class_names = [class_id_to_name[i] for i in range(len(class_id_to_name))] # extract class names from class dict
 plt.figure(figsize=(8,6))
 sns.heatmap(conf_matrix, annot=True, fmt="d",
             xticklabels=class_names,
