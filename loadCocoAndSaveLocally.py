@@ -310,7 +310,7 @@ def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,ima
 
     # ---- Download & save images and masks ----
     count = 0
-    num_workers = max(1, cpu_count() - 1)
+    num_workers = max(1, cpu_count() - 1) # leave a thread to watch youtube while running
 
     tasks = [
         (
@@ -374,7 +374,7 @@ image_base_dir_VAL = f"/home/npurd/trainingData/COCO/val2017"
 
 
 # decide the size of the image you want to make them all
-imageHW = 256 # square image them all
+imageHW = 64 # square image them all
 # where to store downsized versions of all the images
 imagesDownSizedTRAIN = f"/home/npurd/trainingData/COCO/train2017_downsized{imageHW}/"
 imagesDownSizedVAL = f"/home/npurd/trainingData/COCO/val2017_downsized{imageHW}/"

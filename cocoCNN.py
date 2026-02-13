@@ -20,6 +20,7 @@ import os
 import torchvision.transforms.functional as TF
 import torchvision.transforms as T
 from torchvision.utils import save_image
+from torch.optim.lr_scheduler import CosineAnnealingLR
 # import pandas as pd  # Uncomment if you use it elsewhere; not needed here now
 # import seaborn as sns  # Drop this since no more confusion matrices
 
@@ -170,25 +171,42 @@ def custom_cutout(img, rng, p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3)):
     
     return img
 
-
-def segmentation_loss(logits, target):
-
+# for grading heatmap poverlay to truth data label overlay (not sure if there is a better way to judge)
+def segmentation_loss(logits, target, num_classes=81, dice_weight=0.5, eps=1e-8):
+    # Cross-entropy (ignores background via ignore_index=0)
     ce = nn.functional.cross_entropy(logits, target, ignore_index=0, reduction='mean')
-    
-    # Simple multi-class Dice (approximation)
-    probs = torch.softmax(logits, dim=1)  # (B, C, H, W)
-    dice = 0.0
-    num_valid_classes = 0
-    for c in range(1, 81):
-        p = probs[:, c]              # foreground prob for class c
-        t = (target == c).float()    # ground truth mask
-        inter = (p * t).sum()
-        union = p.sum() + t.sum() + 1e-6
-        dice += 1 - (2. * inter + 1) / (union + 1)
-        num_valid_classes += 1 if t.sum() > 0 else 0
-    
-    dice_loss = dice / max(1, num_valid_classes)
-    return ce + 0.5 * dice_loss   # or 1.0 * dice_loss if imbalance is severe
+
+    # Softmax over classes
+    probs = torch.softmax(logits, dim=1)           # (B, C, H, W)
+
+    # One-hot target (only foreground classes matter)
+    target_onehot = torch.zeros_like(probs)
+    target_onehot.scatter_(1, target.unsqueeze(1), 1.0)   # (B, C, H, W)
+
+    # Ignore background channel (index 0)
+    probs_fg   = probs[:, 1:]                         # (B, 80, H, W)
+    target_fg  = target_onehot[:, 1:]                 # (B, 80, H, W)
+
+    # Flatten spatial dims
+    probs_fg   = probs_fg.reshape(probs_fg.size(0), probs_fg.size(1), -1)   # (B, 80, H*W)
+    target_fg  = target_fg.reshape(target_fg.size(0), target_fg.size(1), -1)
+
+    # Intersection and union per class per image
+    inter = (probs_fg * target_fg).sum(dim=2)         # (B, 80)
+    union = probs_fg.sum(dim=2) + target_fg.sum(dim=2)
+
+    # Dice coefficient per class per image
+    dice = (2. * inter + eps) / (union + eps)         # (B, 80)
+    dice_loss = 1 - dice                              # (B, 80)
+
+    # Average only over classes that appear in GT (per image)
+    valid = target_fg.sum(dim=2) > 0                  # (B, 80) — classes present
+    dice_loss = dice_loss * valid.float()
+    dice_loss = dice_loss.sum(dim=1) / (valid.sum(dim=1) + eps)   # mean per image
+
+    dice_loss = dice_loss.mean()                      # mean over batch
+
+    return ce + dice_weight * dice_loss
 
 # for loading data and using the DataLoader torch class
 class COCOSegmentationDataset(Dataset):
@@ -280,71 +298,94 @@ class COCOSegmentationDataset(Dataset):
             # Return dummy sample so batch doesn't break
             return self.dummy_img.clone(), self.dummy_mask.clone(), f"SKIPPED_{filename}"
 
-# CHANGED: New model for segmentation (outputs per-pixel class probs)
+
+# use this residul block class to add resnet to an existing CNN model
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels=None):
+        super().__init__()
+        out_channels = out_channels or in_channels  # default same channels
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_channels)
+
+        # Shortcut for channel change
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += identity
+        out = torch.relu(out)
+        return out
+
+
 class CNNSegmentation(nn.Module):
-    """
-    CNN for semantic segmentation.
-    Input: (B, 3, 256, 256)
-    Output: (B, num_classes, 256, 256) logits (apply softmax/argmax for heatmaps)
-    """
-    def __init__(self, input_channels=3, num_classes=81):
+    def __init__(self, num_classes=81, base_channels=32, channelDepth=3, input_height=64, input_width=64):
         super().__init__()
 
-        # Encoder feature extractor, down to 32x32) 
-        #NOTE dont forget need to pad according to kernel size 
+        if input_height % 8 != 0 or input_width % 8 != 0:
+            raise ValueError(f"Input spatial size must be divisible by 8 (got {input_height}x{input_width})")
+
+        self.expected_h = input_height
+        self.expected_w = input_width
+        # rgb has channel depth of 3
+        c1 = base_channels          # 32
+        c2 = c1 * 2                 # 64
+        c3 = c2 * 2                 # 128
+
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(channelDepth, c1, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
             nn.ReLU(),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 256 -> 128
 
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 128 -> 64
+            ResidualBlock(c1),
+            ResidualBlock(c1),
+            nn.MaxPool2d(2),          #  32x32
 
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 64 -> 32
+            nn.Conv2d(c1, c2, 1),
+            ResidualBlock(c2),
+            ResidualBlock(c2),
+            nn.MaxPool2d(2),          #  16x16
+
+            nn.Conv2d(c2, c3, 1),
+            ResidualBlock(c3),
+            ResidualBlock(c3),
+            nn.MaxPool2d(2),          #  8x8
         )
 
-        # Decoder , upsample back to 256x256 with conv
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2),  # 32 -> 64
-            nn.BatchNorm2d(128),
+            nn.ConvTranspose2d(c3, c3, 2, stride=2),
+            nn.BatchNorm2d(c3),
             nn.ReLU(),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            ResidualBlock(c3),
+
+            nn.ConvTranspose2d(c3, c2, 2, stride=2),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(),
+            ResidualBlock(c2),
+
+            nn.ConvTranspose2d(c2, c1, 2, stride=2),
+            nn.BatchNorm2d(c1),
             nn.ReLU(),
 
-            nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2),    # 64 -> 128
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-
-            nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2),    # 128 -> 256
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, num_classes, kernel_size=1)               # Final 1x1 conv to num_classes
+            nn.Conv2d(c1, num_classes, 1)
         )
 
     def forward(self, x):
-        x = self.encoder(x)  # (B, 128, 32, 32)
-        x = self.decoder(x)  # (B, num_classes, 256, 256)
-        return x  # Logits (use softmax for probs, argmax for heatmap)
-
+        if x.shape[2] != self.expected_h or x.shape[3] != self.expected_w:
+            raise RuntimeError(
+                f"Expected input shape ...x{self.expected_h}x{self.expected_w}, "
+                f"got {x.shape}"
+            )
+        return self.decoder(self.encoder(x))
 
 #  Function to visualize a few images with masks (minor tweaks for torch tensors)
 # Function to visualize a few images with masks
@@ -447,7 +488,7 @@ def trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer):
 
             optimizer.zero_grad()
             outputs = model(images)
-            loss = segmentation_loss(outputs, masks)
+            loss = segmentation_loss(outputs, masks, num_classes=81, dice_weight=0.5, eps=1e-8)
             loss.backward()
             optimizer.step()
 
@@ -533,7 +574,7 @@ def plotTrainingResults(history):
 
 
 #heatmap output of CNN decoder
-def save_per_class_heatmaps(probs, images, filenames,save_dir,epoch=None,alpha=0.5,min_prob_threshold=0.05,colormap='hot'):
+def save_per_class_heatmaps(probs, images, filenames,save_dir,epoch=None,alpha=0.5,min_prob_threshold=0.15,colormap='hot'):
     """
     Saves one blended heatmap overlay per class per image:
     - Heatmap intensity = model probability (0 to 1)
@@ -575,17 +616,17 @@ def save_per_class_heatmaps(probs, images, filenames,save_dir,epoch=None,alpha=0
             colored_heatmap = cm.hot(heatmap_norm)[:, :, :3]  # (H,W,3) float RGB
             colored_heatmap = colored_heatmap.astype(np.float32)
 
-            # Then blend as before:
-            blended = img_np * (1 - alpha) + colored_heatmap * alpha
+            # Inside the class loop  replace the whole fig/canvas block:
+            heatmap_norm = heatmap  # already 0-1
+            cmap_func = cm.get_cmap(colormap)          # 'hot', 'inferno', etc.
+            heatmap_rgb = cmap_func(heatmap_norm)[:, :, :3]  # (H, W, 3) float32 RGB, 0-1
 
-            # Blend: original image + alpha * colored heatmap
+            # No figure, no canvas, no close needed!
+            # Directly blend:
             blended = img_np * (1 - alpha) + heatmap_rgb * alpha
-
-            # Convert to tensor for saving
             blended_tensor = torch.from_numpy(blended).permute(2, 0, 1).clamp(0, 1)
-
-            # Save
             class_name = COCO_CLASSES[cls] if cls < len(COCO_CLASSES) else f"cls{cls}"
+            # Save...
             save_path = os.path.join(
                 save_dir,
                 f"{fname_base}_class{cls:03d}_{class_name}_heatmap_overlay.png"
@@ -593,7 +634,7 @@ def save_per_class_heatmaps(probs, images, filenames,save_dir,epoch=None,alpha=0
             save_image(blended_tensor, save_path)
 
 # for using the model after training is complete, and saving its "outputs" given we feed it some images (heatmaps)
-def predict_and_save_overlays(model,dataloader,save_dir,device,max_batches=None,epoch=None,alpha=0.5,  min_prob_threshold=0.08):
+def predict_and_save_overlays(model,dataloader,save_dir,device,max_batches=None,epoch=None,alpha=0.5,  min_prob_threshold=0.15):
     """
     Runs inference and saves per-class heatmap overlays blended on original images
     """
@@ -609,7 +650,7 @@ def predict_and_save_overlays(model,dataloader,save_dir,device,max_batches=None,
             logits = model(images)                    # (B, 81, H, W)
             probs  = torch.softmax(logits, dim=1)     # probabilities
 
-        # Move to CPU
+        # use data loader object to move mass around
         images_cpu = images.cpu()
         probs_cpu  = probs.cpu()
         
@@ -691,19 +732,20 @@ NOTE: you need to preprocess the data using "loadCocoAndSaveLocally.py" - script
 ################################################ MAAAAAAAAAAAAAAAIIIIIIIIIIIIIIIIIINNNNNNNNNNNNNNNNNN
 
 # Data and masks should be in some local folder, already down converted to some smaller and set pixel width and height 
-imageFolderTrain = "/home/npurd/trainingData/COCO/train2017_downsized128/images"
-maskFolderTrain = "/home/npurd/trainingData/COCO/train2017_downsized128/masks"
-imageFolderVal = "/home/npurd/trainingData/COCO/val2017_downsized128/images"
-maskFolderVal = "/home/npurd/trainingData/COCO/val2017_downsized128/masks"
-dataSet = 'COCO'
+imageHeightWidth = 64
+imageFolderTrain = f"/home/npurd/trainingData/COCO/train2017_downsized{imageHeightWidth}/images"
+maskFolderTrain = f"/home/npurd/trainingData/COCO/train2017_downsized{imageHeightWidth}/masks"
+imageFolderVal = f"/home/npurd/trainingData/COCO/val2017_downsized{imageHeightWidth}/images"
+maskFolderVal = f"/home/npurd/trainingData/COCO/val2017_downsized{imageHeightWidth}/masks"
 
 # file names are simply the imaige ID's, and the masks have the same ID's
 FileList_train = os.listdir(imageFolderTrain)
 FileList_val = os.listdir(imageFolderVal)
 
 # High level run control
-num_epochs = 1
-batch_size = 64
+num_epochs = 20
+batch_size = 128
+augmentData = False # probably not needed for coco, we shall see (dont augment the validation data!)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using {device}")
 
@@ -711,25 +753,26 @@ print(f"Using {device}")
 #make sure the data looks okay (make sure the data loader class is working correclty)
 ########################### TRAINING BELOW @##############
 # set up the data loaders (note the input image size is the target size...)
-train_dataset = COCOSegmentationDataset(fileList=FileList_train,image_folder=imageFolderTrain,mask_folder=maskFolderTrain,target_size=128,augment=True, doCutouts=False)
-val_dataset = COCOSegmentationDataset(fileList=FileList_val,image_folder=imageFolderVal,mask_folder=maskFolderVal,target_size=128,augment=False, doCutouts=False)
+train_dataset = COCOSegmentationDataset(fileList=FileList_train,image_folder=imageFolderTrain,mask_folder=maskFolderTrain,target_size=imageHeightWidth,augment=augmentData, doCutouts=False)
+val_dataset = COCOSegmentationDataset(fileList=FileList_val,image_folder=imageFolderVal,mask_folder=maskFolderVal,target_size=imageHeightWidth,augment=False, doCutouts=False)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, collate_fn=safe_collate_fn,pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, collate_fn=safe_collate_fn,pin_memory=True)
 
 
 # Set up the model ()
-model = CNNSegmentation(input_channels=3, num_classes=81).to(device) 
+model = CNNSegmentation(num_classes=81, base_channels=32, channelDepth=3, input_height=imageHeightWidth, input_width=imageHeightWidth) 
+model = model.to(device)
 criterion = nn.CrossEntropyLoss(ignore_index=0) # ignore background class 0
-optimizer = torch.optim.Adam(model.parameters(), lr=10e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 testName = model.__class__.__name__
-outputFolder = f"testResults_{dataSet}{testName}"
+outputFolder = f"testResults_{testName}"
 os.makedirs(outputFolder, exist_ok=True)
 # TRAIN THE THING HERE
 history = trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer)
 # dry_run_dataloader(train_loader, val_loader=None, max_batches=None)
 
-# save some predictions so we see what the heck the model is thinking
-predict_and_save_overlays(model=model,dataloader=val_loader,save_dir=os.path.join(outputFolder, "val_per_class_heatmaps"),device=device,max_batches=10,epoch=1)
+# save some predictions so we see what the heck the model is thinking (first batch of validation images)
+predict_and_save_overlays(model=model,dataloader=val_loader,save_dir=os.path.join(outputFolder, "val_per_class_heatmaps"),device=device,max_batches=1,epoch=1)
 # plot the results i guess
 plotTrainingResults(history)
