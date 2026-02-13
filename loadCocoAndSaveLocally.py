@@ -40,14 +40,21 @@ PROBLEM 2: the smaller images will dissapear completely, so far away objects wil
 at the worst case the classifier will just suck at far away things in "the field", but should perform okay for training and is still 
 probably a valid experiment if all the validation and training data is "corrupted" in this way
 
-INPUTS: COCO url,saving locations for data and log file
+INPUTS: COCO image path,saving locations for data and log file
 OUTPUT: downsized images and mask images, log file of how many "tiny" masks were destroyed during the downsizing to geta  feel for how much data was
+
+
+NOTE: FIRST RUN: 
+(navigate to where you want this data) then,
+wget http://images.cocodataset.org/zips/train2017.zip    (and same for val)
+wget http://images.cocodataset.org/zips/val2017.zip
+(and also if you want annotations json...)
+wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+unzip train2017.zip
+
+The
 """
 
-LOG_FILE = "/mnt/d/SCHOOL_crap/ece_523/sandbox/dataSets/COCO/logImageDownsizing.txt"
-with open(LOG_FILE, "w") as f:
-    f.write("Image downsizing / segmentation loss log\n")
-    f.write("=" * 60 + "\n\n")
 
 
 
@@ -71,11 +78,11 @@ COCO_CLASSES = [
     "bird",               # 15
     "cat",                # 16
     "dog",                # 17
-    "horse",              # 18
+    "horse",               # 18
     "sheep",              # 19
     "cow",                # 20
     "elephant",          # 21
-    "bear",               # 22
+    "bear",                # 22
     "zebra",              # 23
     "giraffe",           # 24
     "backpack",          # 25
@@ -136,7 +143,7 @@ COCO_CLASSES = [
     "toothbrush",        # 80
 ]
 
-def print_loss_stats(step, skipped_stats, dropped_instances_per_class, top_k=10):
+def print_loss_stats(step, skipped_stats, dropped_instances_per_class, kept_instances_per_class, top_k=10):
     with open(LOG_FILE, "a") as f:
         f.write("\n" + "=" * 50 + "\n")
         f.write(f"[After {step} images] Segmentation loss stats\n")
@@ -151,43 +158,39 @@ def print_loss_stats(step, skipped_stats, dropped_instances_per_class, top_k=10)
         f.write("\nTop dropped classes:\n")
         for cls, cnt in dropped_instances_per_class.most_common(top_k):
             class_name = COCO_CLASSES[cls] if cls < len(COCO_CLASSES) else f"ID {cls}"
-            f.write(f"  {class_name:15s}: {cnt}\n")
+            total_for_class = cnt + kept_instances_per_class.get(cls, 0)
+            percent_lost = (cnt / total_for_class * 100) if total_for_class > 0 else 0
+            f.write(f"  {class_name:15s}: {cnt} ({percent_lost:.2f}%)\n")
 
         f.write("=" * 50 + "\n\n")
 
 def process_single_image(args):
-    image_id, annotations, base_url, output_image_dir, output_mask_dir, target_size = args
+    image_id, annotations, baseInputFolder, output_image_dir, output_mask_dir, target_size = args
 
     local_skipped = Counter()
     local_dropped = Counter()
     local_kept = Counter()
 
-    if not annotations:
+    if not annotations: # skip images without annotations (there are about a thousand of them....)
         return False, local_skipped, local_dropped, local_kept
 
     filename = annotations[0]["file_name"]
-    url = base_url + filename
 
     try:
         # --- Load image ---
-        img = Image.open(requests.get(url, stream=True).raw).convert("RGB")
+        img = Image.open(os.path.join(baseInputFolder, filename)).convert("RGB")
         W_orig, H_orig = img.size
 
         # --- Save resized image ---
         img_resized = img.resize((target_size, target_size), Image.BILINEAR)
-        img_resized.save(
-            os.path.join(output_image_dir, filename.replace(".jpg", ".png"))
-        )
+        img_save_path = os.path.join(output_image_dir, filename.replace(".jpg", ".png"))
+        img_resized.save(img_save_path, format="PNG", optimize=True, compress_level=4)
 
-        # --- Create full-res class mask ---
+        # full resolution mask of classes for the image
         mask_full = np.zeros((H_orig, W_orig), dtype=np.uint8)
 
-        # Draw large objects first (matches your previous intent)
-        annotations_sorted = sorted(
-            annotations, key=lambda a: a.get("area", 0), reverse=True
-        )
-
-       
+        # Draw large objects first so we preserve the small objects in front of large ones
+        annotations_sorted = sorted(annotations, key=lambda a: a.get("area", 0), reverse=True)
 
         for ann in annotations_sorted:
             cat_id = ann["category_id"]
@@ -228,18 +231,44 @@ def process_single_image(args):
 
         mask_np = np.array(mask_resized)
 
-        # --- Optional: class survival stats ---
+        # collect original classes from image segmentation
         orig_classes = {ann["category_id"] for ann in annotations if ann.get("segmentation")}
-        resized_classes = set(np.unique(mask_np)) - {0}
+        # look at what survived the resize mask by subtracting 
+        resized_classes = set(np.unique(mask_np)) - {0} 
 
+        # use the original set of labels to determine what has been lost in downsizing, and wont therefore be part of the images mask
         for cls in orig_classes - resized_classes:
             local_dropped[cls] += 1
             local_skipped["lost_after_resize"] += 1
 
         # --- Save mask ---
-        mask_resized.save(
-            os.path.join(output_mask_dir, filename.replace(".jpg", ".png"))
-        )
+        mask_save_path = os.path.join(output_mask_dir, filename.replace(".jpg", ".png"))
+        mask_resized.save(mask_save_path, format="PNG", optimize=True, compress_level=4)
+
+        # make sure they didnt get corrupted
+        if not verify_image_was_saved_correctly(img_save_path):
+            print(f"!!! CORRUPTED OUTPUT IMAGE: {img_save_path}")
+            # Optional: delete it so it doesn't pollute training
+            try:
+                os.remove(img_save_path)
+            except:
+                pass
+
+        if not verify_image_was_saved_correctly(mask_save_path):
+            print(f"!!! CORRUPTED OUTPUT MASK: {mask_save_path}")
+            try:
+                os.remove(mask_save_path)
+            except:
+                pass
+
+        success = True
+
+        # After both saves + verifications
+        if not verify_image_was_saved_correctly(img_save_path):
+            success = False
+        if not verify_image_was_saved_correctly(mask_save_path):
+            success = False
+
 
         return True, local_skipped, local_dropped, local_kept
 
@@ -248,7 +277,7 @@ def process_single_image(args):
 
 
 # target size is the number of rows and columns used to represent the downsized image.
-def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,base_url,target_size=256):
+def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,imageBaseDir,target_size=256):
 
     output_image_dir = os.path.join(output_dir, "images")
     output_mask_dir = os.path.join(output_dir, "masks")
@@ -287,7 +316,7 @@ def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,bas
         (
             image_id,
             annotations,
-            base_url,
+            imageBaseDir,
             output_image_dir,
             output_mask_dir,
             target_size
@@ -308,7 +337,7 @@ def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,bas
 
                 # Write log every 100 images
                 if count % 100 == 0:
-                    print_loss_stats(count, skipped_stats, dropped_instances_per_class)    # ---- Save pickle ----
+                    print_loss_stats(count, skipped_stats, dropped_instances_per_class, kept_instances_per_class)    # ---- Save pickle ----
     output_pickle = pathToAnnotations.replace(".json", ".pkl")
     to_save = {
         "annotations": dict(coco_dict),
@@ -320,30 +349,47 @@ def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,bas
 
     print(f"Saved {len(coco_dict)} images with annotations to {output_pickle}")
     print(f"Downsized images saved to {output_image_dir}, masks saved to {output_mask_dir}")
-    print_loss_stats(count,skipped_stats,dropped_instances_per_class,top_k=15)
+    print_loss_stats(count,skipped_stats,dropped_instances_per_class, kept_instances_per_class,top_k=15)
 
-    return output_pickle
+    return 
 
-
+def verify_image_was_saved_correctly(filepath):
+    """Returns True if file can be opened as valid image, False otherwise"""
+    try:
+        with Image.open(filepath) as im:
+            im.verify()          # verifies internal PNG structure without loading pixels
+            # Optional: force full decode
+            _ = np.array(im)     # catches some decompression errors
+        return True
+    except Exception as e:
+        print(f"Corruption detected in {filepath}: {type(e).__name__} - {str(e)}")
+        return False
 
 
 # ----------------- Save or Load Binary -----------------
-json_train = f"/home/npurd/School/trainingData2/coco2017/2017coco/annotations/annotations/instances_train2017.json"
-json_val = f"/home/npurd/School/trainingData2/coco2017/2017coco/annotations/annotations/instances_val2017.json"
-image_base_url_TRAIN = f"http://images.cocodataset.org/train2017/"
-image_base_url_VAL = f"http://images.cocodataset.org/val2017/"
+json_train = f"/home/npurd/trainingData/COCO/annotations/instances_train2017.json"
+json_val = f"/home/npurd/trainingData/COCO/annotations/instances_val2017.json"
+image_base_dir_TRAIN = f"/home/npurd/trainingData/COCO/train2017"
+image_base_dir_VAL = f"/home/npurd/trainingData/COCO/val2017"
 
-# where to store downsized versions of all the images
-imagesDownSizedTRAIN = "/mnt/d/SCHOOL_crap/ece_523/sandbox/dataSets/COCO/train/"
-imagesDownSizedVAL = "/mnt/d/SCHOOL_crap/ece_523/sandbox/dataSets/COCO/val/"
 
 # decide the size of the image you want to make them all
-imageHW = 256
+imageHW = 256 # square image them all
+# where to store downsized versions of all the images
+imagesDownSizedTRAIN = f"/home/npurd/trainingData/COCO/train2017_downsized{imageHW}/"
+imagesDownSizedVAL = f"/home/npurd/trainingData/COCO/val2017_downsized{imageHW}/"
+
+
+
+LOG_FILE = f"/home/npurd/trainingData/COCO/logImageDownsizing{imageHW}.txt"
+with open(LOG_FILE, "w") as f:
+    f.write("Image downsizing / segmentation loss log\n")
+    f.write("=" * 60 + "\n\n")
+
 
 # cretes some nice binary files for sifting through and loading images using
 # convert training and validation meta data to binary files (not images...)
-binaryFileTrain = convertJsonsToBinariesAndSaveImagesAndMasks(json_train, imagesDownSizedTRAIN, image_base_url_TRAIN,  imageHW)
+convertJsonsToBinariesAndSaveImagesAndMasks(json_train, imagesDownSizedTRAIN, image_base_dir_TRAIN,  imageHW)
 print(f"Converted {json_train} to binary...")
-binaryFileVal = convertJsonsToBinariesAndSaveImagesAndMasks(json_val, imagesDownSizedVAL, image_base_url_VAL, imageHW)
+convertJsonsToBinariesAndSaveImagesAndMasks(json_val, imagesDownSizedVAL, image_base_dir_VAL, imageHW)
 print(f"Converted {json_val} to binary...")
-
