@@ -1,5 +1,6 @@
 import pickle
 from collections import defaultdict
+from skimage.measure import label as sk_label
 from PIL import Image, ImageDraw, ImageOps, ImageEnhance
 import requests
 from io import BytesIO
@@ -8,6 +9,9 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib.patches import Patch
+import matplotlib.colors as mcolors
+from matplotlib.colorbar import Colorbar
+from matplotlib.figure import Figure
 import torch
 import numpy as np
 import random
@@ -21,8 +25,9 @@ import torchvision.transforms.functional as TF
 import torchvision.transforms as T
 from torchvision.utils import save_image
 from torch.optim.lr_scheduler import CosineAnnealingLR
-# import pandas as pd  # Uncomment if you use it elsewhere; not needed here now
-# import seaborn as sns  # Drop this since no more confusion matrices
+import datetime
+import sys
+from collections import defaultdict
 
 # sorry...
 COCO_CLASSES = [
@@ -108,6 +113,7 @@ COCO_CLASSES = [
     "hair drier",        # 79
     "toothbrush",        # 80
 ]
+
 BASE_COLORS = np.array([
     [230, 25, 75],    # red
     [60, 180, 75],    # green
@@ -337,7 +343,7 @@ class CNNSegmentation(nn.Module):
         self.expected_h = input_height
         self.expected_w = input_width
         # rgb has channel depth of 3
-        c1 = base_channels          # 32
+        c1 = base_channels          # 32 (making the RGB go from 3 to 32 channels gives the NN "more to use to learn" with regard to color)
         c2 = c1 * 2                 # 64
         c3 = c2 * 2                 # 128
 
@@ -434,57 +440,145 @@ def show_images_with_masks(dataset, BASE_COLORS, n=5):
         plt.tight_layout()
         plt.show()
 
-# Function to compute mean IoU ( "grading" metric for mask intersection)
-def compute_miou(preds, labels, num_classes=81, ignore_index=0):
+# Function to compute mean IoU ( "grading" metric for mask intersection) --> vectorized and save massive time during training because its vectorized
+def compute_miou(preds,labels,current_class_mious: dict[int, float],  num_classes: int = 81,ignore_index: int = 0) -> float:
     """
-    Compute mean IoU **only over foreground classes** (ignore background)
-    preds, labels: (B, H, W) long tensors with class IDs
+    Compute mean IoU over foreground classes present in this batch.
+    Also updates current_class_mious with the per-class IoU from *this batch*
+    for every class that appears in either prediction or ground truth.
+
+    Returns: mean IoU of classes that appeared in this batch (or 0.0 if none)
     """
-    ious = []
+    batch_class_ious = {}  # class → iou for this batch only
+
     for c in range(num_classes):
         if c == ignore_index:
-            continue  # skip background
-        
+            continue
+
         pred_mask = (preds == c)
         gt_mask   = (labels == c)
-        
+
         intersection = (pred_mask & gt_mask).sum().float()
         union        = (pred_mask | gt_mask).sum().float()
-        
+
         if union > 0:
             iou = intersection / union
-            ious.append(iou.item())
-        # else: class not present -> we can skip or treat as 0/1 depending on convention
-    
-    if len(ious) == 0:
+            iou_value = iou.item()
+            batch_class_ious[c] = iou_value
+
+    if not batch_class_ious:
         return 0.0
-    return np.mean(ious)
+
+    # Update the persistent dictionary with this batch's values
+    current_class_mious.update(batch_class_ious)
+
+    # Return mean over classes that appeared *in this batch*
+    return np.mean(list(batch_class_ious.values()))
+
+def compute_ap_per_class(preds, labels, probs, num_classes=81):
+    ap_dict = {}
+    all_ap = []
+
+    preds = preds.cpu().numpy()   # (B, H, W)
+    labels = labels.cpu().numpy() # (B, H, W)
+    probs = probs.cpu().numpy()   # (B, C, H, W)
+
+    for c in range(1, num_classes):
+        # Use ALL pixels — no masking
+        gt = (labels == c).ravel()                  # binary vector over all pixels
+        if gt.sum() == 0:
+            continue
+
+        score = probs[:, c].ravel()                 # confidence for class c, all pixels
+        # pred is not needed for ranking — we sort by score
+
+        # Sort descending confidence
+        idx = np.argsort(-score)
+        gts_sorted = gt[idx]
+
+        tp = np.cumsum(gts_sorted)
+        fp = np.cumsum(1 - gts_sorted)
+
+        total_gt = np.sum(gt)  # same as before
+        recall = tp / total_gt
+        precision = tp / (tp + fp + 1e-12)
+
+        # 101-point interpolation
+        ap = 0.0
+        for t in np.linspace(0, 1, 101):
+            if np.any(recall >= t):
+                p = np.max(precision[recall >= t])
+                ap += p / 101
+
+        ap_dict[c] = ap
+        all_ap.append(ap)
+
+    mAP = np.mean(all_ap) if all_ap else 0.0
+    return mAP, ap_dict
+
+def compute_macro_f1(preds, labels, num_classes=81, eps=1e-8):   # ← remove _per_class from name
+    preds = preds.cpu().numpy().ravel()
+    labels = labels.cpu().numpy().ravel()
+    
+    f1_per_class = []
+    
+    for c in range(1, num_classes):
+        pred_c = (preds == c)
+        gt_c   = (labels == c)
+        
+        tp = np.logical_and(pred_c, gt_c).sum()
+        fp = np.logical_and(pred_c, ~gt_c).sum()
+        fn = np.logical_and(~pred_c, gt_c).sum()
+        
+        precision = tp / (tp + fp + eps) if (tp + fp) > 0 else 0.0
+        recall    = tp / (tp + fn + eps) if (tp + fn) > 0 else 0.0
+        f1        = 2 * precision * recall / (precision + recall + eps) if (precision + recall) > 0 else 0.0
+        
+        f1_per_class.append(f1)
+    
+    if not f1_per_class:
+        return 0.0
+    return np.mean(f1_per_class)
 
 #  training loop for segmentation (uses masks, CrossEntropy, mIoU)
-def trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer):
-    failed = 0 # for tracking failures to load in...
+def trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer, scheduler,
+                 learningRate=0.001, useScheduler=False):
+    """
+    Training loop with:
+    - Loss + mean mIoU (epoch-averaged)
+    - Per-class mIoU (epoch-averaged) for train and val → saved separately
+    - overall f1 NOTE: make this class based at some point...
+    """
     history = {
         "train_loss": [],
-        "train_miou": [],  
+        "train_miou": [],
         "val_loss": [],
-        "val_miou": []
+        "val_miou": [],
+        "lr": [],
+        "val_macro_f1": []
+        # "val_map": [],                    # mean AP over classes (validation)
+        # "val_ap_per_class": defaultdict(list),  # class → [ap_epoch1, ap_epoch2, ...]
     }
 
+    # Full per-class mIoU histories (class_id → list of epoch values)
+    per_epoch_class_iou_train = defaultdict(list)
+    per_epoch_class_iou_val   = defaultdict(list)
 
     for epoch in range(num_epochs):
+        # ──────────────────────── Training ────────────────────────
         model.train()
         running_loss = 0.0
         running_miou = 0.0
         num_batches_train = 0
 
-        # try:
-        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
+        epoch_inter_train = defaultdict(float)
+        epoch_union_train = defaultdict(float)
 
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
 
         for images, masks, _ in train_bar:
             images = images.to(device)
             masks  = masks.to(device)
-
 
             optimizer.zero_grad()
             outputs = model(images)
@@ -492,97 +586,312 @@ def trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer):
             loss.backward()
             optimizer.step()
 
-            # Loss accumulation
             running_loss += loss.item() * images.size(0)
 
-            # mIoU per batch
             preds = torch.argmax(outputs, dim=1)
 
-            # if num_batches_train % 100 == 0: # for debugging
-            #     unique_pred = torch.unique(preds[0]).cpu().tolist()   # first image in batch
-            #     unique_maskClasses   = torch.unique(masks[0]).cpu().tolist()
-                
-                # print(f"Batch {num_batches_train:4d} | Pred classes: {unique_pred} | GT classes: {unique_maskClasses} | Pred fraction class 1: {(preds[0] == 1).float().mean().item()*100:.1f}%")
-            batch_miou = compute_miou(preds, masks, num_classes=81, ignore_index=0)
+            # Accumulate per-class intersection/union
+            for c in range(1, 81):
+                p = (preds == c)
+                g = (masks == c)
+                inter = (p & g).sum().item()
+                union = (p | g).sum().item()
+                if union > 0:
+                    epoch_inter_train[c] += inter
+                    epoch_union_train[c] += union
+
+            # Optional: per-batch mIoU for progress bar (still using old function)
+            batch_miou = compute_miou(preds, masks, current_class_mious={}, num_classes=81, ignore_index=0)
             running_miou += batch_miou
             num_batches_train += 1
 
-            train_bar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "miou": f"{batch_miou:.4f}",           # per-batch view
-            })
+            train_bar.set_postfix(loss=f"{loss.item():.4f}", miou=f"{batch_miou:.4f}")
 
         train_loss = running_loss / len(train_dataset)
-        train_miou = running_miou / num_batches_train   #average miou based on number of batches in training set (its already averaged)
+        train_miou = running_miou / num_batches_train
+        history["train_loss"].append(train_loss)
+        history["train_miou"].append(train_miou)
+        # Compute per-class mIoU for this epoch (training)
+        epoch_iou_train = {}
+        for c in epoch_inter_train:
+            if epoch_union_train[c] > 0:
+                epoch_iou_train[c] = epoch_inter_train[c] / epoch_union_train[c]
 
-        # validation time
+        # Store history
+        for cls, iou in epoch_iou_train.items():
+            per_epoch_class_iou_train[cls].append(iou)
+
+        # ──────────────────────── Validation ───────────────────────
         model.eval()
         val_loss = 0.0
         val_miou = 0.0
+        running_macro_f1 = 0.0              # ← new
         num_batches_val = 0
 
+        epoch_inter_val = defaultdict(float)
+        epoch_union_val = defaultdict(float)
+
         with torch.no_grad():
-            for images, masks, _ in val_loader:
+            val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
+            for images, masks, _ in val_bar:
                 images = images.to(device)
                 masks  = masks.to(device)
 
                 outputs = model(images)
                 loss = segmentation_loss(outputs, masks)
-
                 val_loss += loss.item() * images.size(0)
 
                 preds = torch.argmax(outputs, dim=1)
-                batch_miou = compute_miou(preds, masks, num_classes=81, ignore_index=0)
+                # probs = torch.softmax(outputs, dim=1)   # ← no longer needed for F1
+
+                # Accumulate per-class IoU
+                for c in range(1, 81):
+                    p = (preds == c)
+                    g = (masks == c)
+                    inter = (p & g).sum().item()
+                    union = (p | g).sum().item()
+                    if union > 0:
+                        epoch_inter_val[c] += inter
+                        epoch_union_val[c] += union
+
+                # macro F1 instead of AP since AP takes a long time to calculate during training...
+                batch_f1 = compute_macro_f1(preds, masks, num_classes=81)
+                running_macro_f1 += batch_f1
+
+                batch_miou = compute_miou(preds, masks, current_class_mious={}, num_classes=81, ignore_index=0)
                 val_miou += batch_miou
                 num_batches_val += 1
 
+                val_bar.set_postfix(loss=f"{loss.item():.4f}", miou=f"{batch_miou:.4f}", f1=f"{batch_f1:.4f}")
+
         val_loss /= len(val_dataset)
         val_miou /= num_batches_val
+        val_macro_f1 = running_macro_f1 / num_batches_val
 
-        # save values
-        history["train_loss"].append(train_loss)
-        history["train_miou"].append(train_miou)
-        history["val_loss"].append(val_loss)
+        history["val_macro_f1"].append(val_macro_f1)
+        history["val_loss"].append(val_loss)         # ← good to have
         history["val_miou"].append(val_miou)
 
+        # per-class IoU computation (unchanged)
+        epoch_iou_val = {}
+        for c in epoch_inter_val:
+            if epoch_union_val[c] > 0:
+                epoch_iou_val[c] = epoch_inter_val[c] / epoch_union_val[c]
+
+        for cls, iou in epoch_iou_val.items():
+            per_epoch_class_iou_val[cls].append(iou)
+
+        # Scheduler & Logging
+        if useScheduler and scheduler is not None:
+            scheduler.step()
+
+        current_lr = optimizer.param_groups[0]['lr'] if optimizer.param_groups else learningRate
+        history['lr'].append(current_lr)
+
         print(f"Epoch {epoch+1}/{num_epochs} "
-            f"- train_loss: {train_loss:.4f}  "
-            f"- train_miou: {train_miou:.4f}  "  
-            f"- val_loss: {val_loss:.4f} "
-            f"- val_miou: {val_miou:.4f}")
-        # except:
-        #     failed += 1
-        #     print(f"failed to process/train on {failed} images")
+              f"| train_loss: {train_loss:.4f} | train_miou: {train_miou:.4f} "
+              f"| val_loss: {val_loss:.4f} | val_miou: {val_miou:.4f} "
+              f"| val_macro_F1: {val_macro_f1:.4f} | lr: {current_lr:.6f}")
+
+        # Print extremes (training)
+        if epoch_iou_train:
+            ranked = sorted(epoch_iou_train.items(), key=lambda x: x[1])
+            shown = ranked[:5] + ranked[-5:] if len(ranked) > 10 else ranked
+            parts = [f"{cls:2d}:{COCO_CLASSES[cls][:7]}{'…' if len(COCO_CLASSES[cls])>7 else ''}:{iou:.3f}"
+                     for cls, iou in shown]
+            line = " | ".join(parts[:5]) + (" ... " + " | ".join(parts[5:]) if len(ranked)>10 else "")
+            print(f"Ep {epoch+1:3d} extremes (train) IoU: {line}")
+
+    # ── Save histories after training ───────────────────────────────
+    save_path_iou_train = os.path.join(outputFolder, "per_class_iou_train_per_epoch.pkl")
+    with open(save_path_iou_train, "wb") as f:
+        pickle.dump(dict(per_epoch_class_iou_train), f)
+
+    save_path_iou_val = os.path.join(outputFolder, "per_class_iou_val_per_epoch.pkl")
+    with open(save_path_iou_val, "wb") as f:
+        pickle.dump(dict(per_epoch_class_iou_val), f)
+
+
+    print("\nTraining finished. Saved:")
+    print(f"  → {save_path_iou_train}")
+    print(f"  → {save_path_iou_val}")
 
     return history
 
-# CHANGED: Updated plotting (drop multi-label stuff, focus on loss/mIoU)
-def plotTrainingResults(history):
-    # --- Plot training history ---
-    # history_df = pd.DataFrame(history)  # Drop pandas if not needed
-    # history_df.plot(figsize=(8,5))
-    plt.figure(figsize=(8,5))
-    plt.plot(history["train_loss"], label="Train Loss")
-    plt.plot(history["val_loss"], label="Val Loss")
-    plt.plot(history["val_miou"], label="Val mIoU")
-    plt.grid(True)
+# plot training history
+def plotTrainingResults(history, output_folder):
+    epochs = list(range(1, len(history["train_loss"]) + 1))
+
+    # ── Plot 1: Loss ────────────────────────────────────────────────
+    plt.figure(figsize=(9, 5))
+    plt.plot(epochs, history["train_loss"], label="Train Loss", linewidth=2)
+    plt.plot(epochs, history["val_loss"],   label="Val Loss",   linewidth=2)
+    plt.title("Cross-Entropy + Dice Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
     plt.legend()
-    plt.savefig(f"{outputFolder}/training.png")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, "loss_train_vs_val.png"), dpi=140)
     plt.show()
 
-    # Drop per-class confusion (not relevant for segmentation)
+    # ── Plot 2: mIoU ────────────────────────────────────────────────
+    plt.figure(figsize=(9, 5))
+    plt.plot(epochs, history["train_miou"], label="Train mIoU", linewidth=2)
+    plt.plot(epochs, history["val_miou"],   label="Val mIoU",   linewidth=2)
+    plt.title("Mean Intersection over Union (foreground classes)")
+    plt.xlabel("Epoch")
+    plt.ylabel("mIoU")
+    plt.ylim(0, 1)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, "miou_train_vs_val.png"), dpi=140)
+    plt.show()
 
+    # ── Plot 3: mAP (pixel-level AP) ─────────────────────────────────
+    plt.figure(figsize=(9, 5))
+    plt.plot(epochs, history["val_macro_f1"], label="Val Macro F1", linewidth=2)
+    plt.title("Macro-averaged F1 Score (foreground classes)")
+    plt.xlabel("Epoch")
+    plt.ylabel("Macro F1")
+    plt.ylim(0, 1)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, "macro_f1_val.png"), dpi=140)
+    plt.show()
+
+    # ── Learning rate (keep separate) ────────────────────────────────
+    plt.figure(figsize=(9, 4))
+    plt.plot(epochs, history["lr"], label="Learning Rate", color="darkgreen", linewidth=2)
+    plt.title("Learning Rate Schedule")
+    plt.xlabel("Epoch")
+    plt.ylabel("LR")
+    plt.yscale("log")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, "learning_rate.png"), dpi=140)
+    plt.show()
+    # Drop per-class confusion (not relevant for segmentation)
+# plot more class specific training history
+def plot_per_class_iou_progress(output_folder, max_classes=12,sortLargeToSmall=True):
+    import pickle
+    import matplotlib.pyplot as plt
+    import os
+
+    pkl_path = os.path.join(output_folder, "per_class_iou_val_per_epoch.pkl")
+    if not os.path.exists(pkl_path):
+        print("No per-class history found.")
+        return
+
+    with open(pkl_path, "rb") as f:
+        history = pickle.load(f)
+
+    if not history:
+        print("No data in per-class history.")
+        return
+
+    # Sort classes by final IoU (descending)
+    sorted_classes = sorted(
+        history.items(),
+        key=lambda x: x[1][-1] if x[1] else -1,
+        reverse=sortLargeToSmall
+    )
+
+    plt.figure(figsize=(12, 7))
+
+    plotted = 0
+    for cls_id, iou_list in sorted_classes:
+        if not iou_list:
+            continue
+        if plotted >= max_classes:
+            break
+
+        name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"cls{cls_id}"
+        epochs = list(range(1, len(iou_list) + 1))
+        plt.plot(epochs, iou_list, marker=".", linewidth=1.1, label=f"{cls_id:2d} {name}")
+
+        plotted += 1
+
+    plt.xlabel("Epoch")
+    plt.ylabel("mIoU")
+    plt.title("Per-class mIoU progress (val) - top classes by final value" if sortLargeToSmall else "Per-class mIoU progress (val) - bottom classes by final value")
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    save_fig = os.path.join(output_folder, "per_class_iou_progress.png")
+    plt.savefig(save_fig, dpi=140, bbox_inches="tight")
+    plt.show()
+
+    print(f"Saved plot: {save_fig}")
+
+def plot_per_class_ap_progress(output_folder, max_classes=12, sortLargeToSmall=True):
+    import pickle
+    import matplotlib.pyplot as plt
+    import os
+
+    pkl_path = os.path.join(output_folder, "per_class_ap_per_epoch.pkl")
+    if not os.path.exists(pkl_path):
+        print("No per-class AP history found.")
+        return
+
+    with open(pkl_path, "rb") as f:
+        history_ap = pickle.load(f)
+
+    if not history_ap:
+        print("No data in per-class AP history.")
+        return
+
+    sorted_classes = sorted(
+        history_ap.items(),
+        key=lambda x: x[1][-1] if x[1] else -1,
+        reverse=sortLargeToSmall
+    )
+
+    plt.figure(figsize=(12, 7))
+    plotted = 0
+    for cls_id, ap_list in sorted_classes:
+        if not ap_list:
+            continue
+        if plotted >= max_classes:
+            break
+
+        name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"cls{cls_id}"
+        epochs = list(range(1, len(ap_list) + 1))
+        plt.plot(epochs, ap_list, marker=".", linewidth=1.1, label=f"{cls_id:2d} {name}")
+        plotted += 1
+
+    plt.xlabel("Epoch")
+    plt.ylabel("AP")
+    plt.title("Per-class pixel AP progress (top classes by final value)" if sortLargeToSmall else "Per-class pixel AP progress (bottom classes by final value)")
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    save_fig = os.path.join(output_folder, "per_class_ap_progress.png")
+    plt.savefig(save_fig, dpi=140, bbox_inches="tight")
+    plt.show()
+
+    print(f"Saved AP plot: {save_fig}")
 
 #heatmap output of CNN decoder
-def save_per_class_heatmaps(probs, images, filenames,save_dir,epoch=None,alpha=0.5,min_prob_threshold=0.15,colormap='hot'):
+def save_per_class_heatmaps(probs, images, filenames, save_dir, epoch=None, alpha=0.5,
+                           min_prob_threshold=0.15, colormap='turbo', vis_threshold=0.10):
     """
-    Saves one blended heatmap overlay per class per image:
-    - Heatmap intensity = model probability (0 to 1)
-    - Thermal-style colormap overlaid semi-transparently on the original image
-    - Only for classes with at least some meaningful confidence determined by threshold input param
+    Saves a three-panel figure per class:
+    - Left: original image
+    - Middle: pure probability heatmap (colored mask only)
+    - Right: blended overlay (image + heatmap)
+    + colorbar on the far right
     """
     os.makedirs(save_dir, exist_ok=True)
     B, C, H, W = probs.shape
+
+    norm = mcolors.Normalize(vmin=0, vmax=1)
+    cmap = plt.get_cmap(colormap)
 
     for b in range(B):
         fname_base = filenames[b]
@@ -590,48 +899,81 @@ def save_per_class_heatmaps(probs, images, filenames,save_dir,epoch=None,alpha=0
             fname_base = f"epoch{epoch:03d}_{fname_base}"
         fname_base = os.path.splitext(fname_base)[0]
 
-        # Original image as numpy (H,W,3), 0-1
         img_np = images[b].cpu().permute(1, 2, 0).numpy()
 
-        # Max probability per class across spatial dimensions
-        max_per_class = probs[b].amax(dim=(1, 2))   # use .amax() for multi-dim max
-        active_classes = torch.where(max_per_class >= min_prob_threshold)[0]
+        max_per_class = probs[b].amax(dim=(1, 2))
+        active_mask = max_per_class >= min_prob_threshold
+        active_classes = torch.nonzero(active_mask)[:, 0]
+        max_probs_active = max_per_class[active_mask]
 
-        for cls in active_classes:
-            if cls == 0:  # skip background
+        if len(active_classes) == 0:
+            continue
+
+        sort_idx = torch.argsort(max_probs_active, descending=True)
+        sorted_classes = active_classes[sort_idx]
+        sorted_max_probs = max_probs_active[sort_idx]
+
+        for idx, cls_tensor in enumerate(sorted_classes):
+            cls = cls_tensor.item()
+            if cls == 0:
                 continue
 
-            # Get probability map for this class (H,W)
-            heatmap = probs[b, cls].cpu().numpy()  # 0–1
+            heatmap = probs[b, cls].cpu().numpy()
 
-            # Create colored heatmap using matplotlib colormap
-            fig, ax = plt.subplots(figsize=(W/100, H/100), dpi=100)
-            im = ax.imshow(heatmap, cmap=colormap, vmin=0, vmax=1)
-            ax.axis('off')
-            fig.tight_layout(pad=0, h_pad=0, w_pad=0)
-            fig.canvas.draw()
+            # Visualization mask (for blended version only)
+            alpha_mask = (heatmap >= vis_threshold).astype(np.float32)
 
-            # heatmap
-            heatmap_norm = heatmap  # already 0-1
-            colored_heatmap = cm.hot(heatmap_norm)[:, :, :3]  # (H,W,3) float RGB
-            colored_heatmap = colored_heatmap.astype(np.float32)
+            # Pure colored heatmap (no image underneath)
+            pure_heatmap_rgb = cmap(norm(heatmap))[:, :, :3]   # (H,W,3)
 
-            # Inside the class loop  replace the whole fig/canvas block:
-            heatmap_norm = heatmap  # already 0-1
-            cmap_func = cm.get_cmap(colormap)          # 'hot', 'inferno', etc.
-            heatmap_rgb = cmap_func(heatmap_norm)[:, :, :3]  # (H, W, 3) float32 RGB, 0-1
+            # Blended version
+            blended = img_np * (1 - alpha * alpha_mask[..., None]) + \
+                      pure_heatmap_rgb * (alpha * alpha_mask[..., None])
+            blended = np.clip(blended, 0, 1)
 
-            # No figure, no canvas, no close needed!
-            # Directly blend:
-            blended = img_np * (1 - alpha) + heatmap_rgb * alpha
-            blended_tensor = torch.from_numpy(blended).permute(2, 0, 1).clamp(0, 1)
             class_name = COCO_CLASSES[cls] if cls < len(COCO_CLASSES) else f"cls{cls}"
-            # Save...
+            max_p = sorted_max_probs[idx].item()
+
+            # Three-panel figure: original | pure mask | blended + colorbar
+            fig = plt.figure(figsize=((W/100)*3 + 4, H/100 + 1.4))  # wider for 3 panels + colorbar
+
+            # Left: original image
+            ax_orig = fig.add_axes([0.04, 0.15, W/(W*3 + 400), 0.72])
+            ax_orig.imshow(img_np)
+            ax_orig.axis('off')
+            ax_orig.set_title("Original", fontsize=8)
+
+            # Middle: pure heatmap (colored probability map)
+            ax_pure = fig.add_axes([0.37, 0.15, W/(W*3 + 400), 0.72])
+            im_pure = ax_pure.imshow(pure_heatmap_rgb)
+            ax_pure.axis('off')
+            ax_pure.set_title(f"Pure {class_name} Prob", fontsize=8)
+
+            # Right: blended overlay
+            ax_blend = fig.add_axes([0.70, 0.15, W/(W*3 + 400), 0.72])
+            ax_blend.imshow(blended)
+            ax_blend.axis('off')
+            ax_blend.set_title(f"Overlay (max: {max_p:.3f})", fontsize=8)
+
+            # Colorbar (far right, aligned with the panels)
+            ax_cbar = fig.add_axes([0.935, 0.15, 0.018, 0.72])
+            cbar = fig.colorbar(im_pure,cax=ax_cbar,orientation='vertical',ticks=[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            cbar.ax.tick_params(labelsize=6)
+            cbar.set_label('Probability', rotation=270, labelpad=12, fontsize=8)
+
+            # Overall figure title
+            fig.suptitle(f"{fname_base} – Class {cls:03d} ({class_name})", fontsize=10, y=0.98)
+
+            # Save
             save_path = os.path.join(
                 save_dir,
-                f"{fname_base}_class{cls:03d}_{class_name}_heatmap_overlay.png"
+                f"{fname_base}_class{cls:03d}_{class_name}_maxp{max_p:.3f}_three_panel.png"
             )
-            save_image(blended_tensor, save_path)
+            fig.savefig(save_path, dpi=220, bbox_inches='tight', pad_inches=0.12)
+            plt.close(fig)
+
+    print(f"Saved three-panel figures to: {save_dir}")
+
 
 # for using the model after training is complete, and saving its "outputs" given we feed it some images (heatmaps)
 def predict_and_save_overlays(model,dataloader,save_dir,device,max_batches=None,epoch=None,alpha=0.5,  min_prob_threshold=0.15):
@@ -654,7 +996,7 @@ def predict_and_save_overlays(model,dataloader,save_dir,device,max_batches=None,
         images_cpu = images.cpu()
         probs_cpu  = probs.cpu()
         
-        save_per_class_heatmaps(probs=probs_cpu,images=images_cpu,filenames=filenames,save_dir=save_dir,epoch=epoch,alpha=alpha,min_prob_threshold=min_prob_threshold,colormap= 'hot')
+        save_per_class_heatmaps(probs=probs_cpu,images=images_cpu,filenames=filenames,save_dir=save_dir,epoch=epoch,alpha=alpha,min_prob_threshold=min_prob_threshold,colormap= 'turbo')
         
         batch_count += 1
         if max_batches is not None and batch_count >= max_batches:
@@ -725,6 +1067,83 @@ def dry_run_dataloader(train_loader, val_loader=None, max_batches=None):
     print("\nDry run FINISHED — your data loader is stable.")
 
 
+def save_training_setup(output_folder, model, optimizer, scheduler, train_dataset, val_dataset):
+    """
+    Saves key configuration and setup info to trainingSetup.txt
+    """
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # can also add in 
+    python_version = sys.version.split('\n')[0]
+    torch_version = torch.__version__
+    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+
+    lines = []
+    lines.append("________________________________________________________________")
+    lines.append(f"       Training Setup Summary - {now}")
+    lines.append("----------------------------------------------------------------")
+    lines.append("")
+    lines.append(f"Date / Time:          {now}")
+    lines.append(f"Python:               {python_version}")
+    lines.append(f"PyTorch:              {torch_version}")
+    lines.append(f"Device:               {device} ({device_name})")
+    lines.append("")
+
+    #  Data 
+    lines.append("[ Data ]")
+    lines.append(f"Image size:           {imageHeightWidth} x {imageHeightWidth}")
+    lines.append(f"Train images:         {len(train_dataset):,d}")
+    lines.append(f"Val images:           {len(val_dataset):,d}")
+    lines.append(f"Batch size:           {batch_size}")
+    lines.append(f"Augmentation (train): {augmentData}")
+    lines.append(f"Cutout (train):       {train_dataset.doCutouts}")
+    lines.append(f"Classes:              {model.decoder[-1].out_channels} (0=bg)")
+    lines.append("")
+
+    #  Paths 
+    lines.append("[ Paths ]")
+    lines.append(f"Train images:         {imageFolderTrain}")
+    lines.append(f"Train masks:          {maskFolderTrain}")
+    lines.append(f"Val images:           {imageFolderVal}")
+    lines.append(f"Val masks:            {maskFolderVal}")
+    lines.append(f"Output folder:        {output_folder}")
+    lines.append("")
+
+    #  Training 
+    lines.append("[ Training ]")
+    lines.append(f"Epochs:               {num_epochs}")
+    lines.append(f"Optimizer:            {optimizer.__class__.__name__}")
+    lines.append(f"Initial LR:           {optimizer.param_groups[0]['lr']:.2e}")
+    lines.append(f"Scheduler:            {scheduler.__class__.__name__}")
+    
+    if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+        lines.append(f"  --> T_max:            {scheduler.T_max}")
+        lines.append(f"  --> eta_min:          {scheduler.eta_min:.2e}")
+    
+    lines.append(f"Loss function:        Custom (CE + {0.5}xDice)")
+    lines.append("")
+
+    #  Model 
+    lines.append("[ Model ]")
+    lines.append(f"Class:                {model.__class__.__name__}")
+    lines.append(f"Base channels:        {model.encoder[0].out_channels}")
+    lines.append(f"Input shape:          3 x {model.expected_h} x {model.expected_w}")
+    lines.append(f"Output channels:      {model.decoder[-1].out_channels}")
+    
+    # Optional: total number of parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lines.append(f"Total parameters:     {total_params:,d}")
+    lines.append(f"Trainable parameters: {trainable_params:,d}")
+    lines.append("")
+
+    #  Write to file 
+    setup_path = os.path.join(output_folder, "trainingSetup.txt")
+    with open(setup_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"Saved training setup to: {setup_path}")
+
+
+
 """
 NOTE: you need to preprocess the data using "loadCocoAndSaveLocally.py" - script should be in same folder as this one
 
@@ -743,9 +1162,10 @@ FileList_train = os.listdir(imageFolderTrain)
 FileList_val = os.listdir(imageFolderVal)
 
 # High level run control
-num_epochs = 20
-batch_size = 128
-augmentData = False # probably not needed for coco, we shall see (dont augment the validation data!)
+num_epochs = 300
+batch_size = 256 # sort of function of input image size, if 64x64 or less, do >128, if 256x256, do < 16 (exponential relationship)
+learningRate = np.round(batch_size*0.000009, 6) # learning rate should be some rough function of batch size (in general, not speciifically for this NN)
+augmentData = True # probably not needed for coco, we shall see (dont augment the validation data!)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using {device}")
 
@@ -755,24 +1175,31 @@ print(f"Using {device}")
 # set up the data loaders (note the input image size is the target size...)
 train_dataset = COCOSegmentationDataset(fileList=FileList_train,image_folder=imageFolderTrain,mask_folder=maskFolderTrain,target_size=imageHeightWidth,augment=augmentData, doCutouts=False)
 val_dataset = COCOSegmentationDataset(fileList=FileList_val,image_folder=imageFolderVal,mask_folder=maskFolderVal,target_size=imageHeightWidth,augment=False, doCutouts=False)
-
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, collate_fn=safe_collate_fn,pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, collate_fn=safe_collate_fn,pin_memory=True)
+# using ~2 workers seems to be a happy spot, not sure if its cuz then more cores for training work, loading is not the bottlneck here....
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=int(batch_size/64), collate_fn=safe_collate_fn,pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=int(batch_size/64), collate_fn=safe_collate_fn,pin_memory=True)
 
 
 # Set up the model ()
 model = CNNSegmentation(num_classes=81, base_channels=32, channelDepth=3, input_height=imageHeightWidth, input_width=imageHeightWidth) 
 model = model.to(device)
 criterion = nn.CrossEntropyLoss(ignore_index=0) # ignore background class 0
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=learningRate)
+scheduler = CosineAnnealingLR(optimizer,T_max=num_epochs,eta_min=1e-6,last_epoch=-1) # scheduler will change arressiveness depending on number of epochs planned on training
 testName = model.__class__.__name__
-outputFolder = f"testResults_{testName}"
+outputFolder = f"testResults_{testName}{num_epochs}"
 os.makedirs(outputFolder, exist_ok=True)
+# save meta data so i can correspond output performance of DOE studies to inputs... (for mass analysis comparison)
+save_training_setup(outputFolder, model, optimizer, scheduler, train_dataset, val_dataset)
 # TRAIN THE THING HERE
-history = trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer)
-# dry_run_dataloader(train_loader, val_loader=None, max_batches=None)
 
+history = trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer, scheduler,learningRate=learningRate, useScheduler=True)
+# dry_run_dataloader(train_loader, val_loader=None, max_batches=None)
+# plot the results i guess
+plotTrainingResults(history, outputFolder)
+plot_per_class_iou_progress(outputFolder, max_classes=10, sortLargeToSmall=True) # show miou history for 10 best classes
+plot_per_class_iou_progress(outputFolder, max_classes=10,sortLargeToSmall=False)  # show miuo histoyr for worst wlasses
+plot_per_class_ap_progress(outputFolder, max_classes=10, sortLargeToSmall=True) # show MAP history
+plot_per_class_ap_progress(outputFolder, max_classes=10, sortLargeToSmall=False)
 # save some predictions so we see what the heck the model is thinking (first batch of validation images)
 predict_and_save_overlays(model=model,dataloader=val_loader,save_dir=os.path.join(outputFolder, "val_per_class_heatmaps"),device=device,max_batches=1,epoch=1)
-# plot the results i guess
-plotTrainingResults(history)
