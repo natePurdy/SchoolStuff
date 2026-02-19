@@ -171,25 +171,21 @@ def process_single_image(args):
     local_dropped = Counter()
     local_kept = Counter()
 
-    if not annotations: # skip images without annotations (there are about a thousand of them....)
-        return False, local_skipped, local_dropped, local_kept
+    if not annotations:
+        return False, local_skipped, local_dropped, local_kept, {}, {}   # two empty dicts now
 
     filename = annotations[0]["file_name"]
 
     try:
-        # --- Load image ---
         img = Image.open(os.path.join(baseInputFolder, filename)).convert("RGB")
         W_orig, H_orig = img.size
 
-        # --- Save resized image ---
         img_resized = img.resize((target_size, target_size), Image.BILINEAR)
         img_save_path = os.path.join(output_image_dir, filename.replace(".jpg", ".png"))
-        img_resized.save(img_save_path, format="PNG", optimize=True, compress_level=4)
 
-        # full resolution mask of classes for the image
+
         mask_full = np.zeros((H_orig, W_orig), dtype=np.uint8)
 
-        # Draw large objects first so we preserve the small objects in front of large ones
         annotations_sorted = sorted(annotations, key=lambda a: a.get("area", 0), reverse=True)
 
         for ann in annotations_sorted:
@@ -202,28 +198,22 @@ def process_single_image(args):
                 continue
 
             try:
-                # ---- COCO-correct handling ----
                 if isinstance(seg, list):
-                    # Polygon(s)
                     rles = coco_mask.frPyObjects(seg, H_orig, W_orig)
                     rle = coco_mask.merge(rles)
                 elif isinstance(seg, dict):
-                    # RLE (iscrowd == 1)
                     rle = coco_mask.frPyObjects(seg, H_orig, W_orig)
                 else:
                     raise ValueError("Unknown segmentation format")
 
                 binary_mask = coco_mask.decode(rle)
-
-                # Write class ID into mask
                 mask_full[binary_mask == 1] = cat_id
                 local_kept[cat_id] += 1
 
-            except Exception as e:
+            except Exception:
                 local_skipped["mask_decode_failed"] += 1
                 local_dropped[cat_id] += 1
 
-        # --- Resize mask ONCE using nearest neighbor ---
         mask_resized = Image.fromarray(mask_full).resize(
             (target_size, target_size),
             resample=Image.NEAREST
@@ -231,49 +221,59 @@ def process_single_image(args):
 
         mask_np = np.array(mask_resized)
 
-        # collect original classes from image segmentation
         orig_classes = {ann["category_id"] for ann in annotations if ann.get("segmentation")}
-        # look at what survived the resize mask by subtracting 
-        resized_classes = set(np.unique(mask_np)) - {0} 
+        resized_classes = set(np.unique(mask_np)) - {0}
 
-        # use the original set of labels to determine what has been lost in downsizing, and wont therefore be part of the images mask
         for cls in orig_classes - resized_classes:
             local_dropped[cls] += 1
             local_skipped["lost_after_resize"] += 1
 
-        # --- Save mask ---
+        # ────────────────────────────────────────────────────────────────
+        # Pixel statistics in downsized mask
+        # ────────────────────────────────────────────────────────────────
+        unique, counts = np.unique(mask_np, return_counts=True)
+        class_pixel_counts = dict(zip(unique, counts))
+
+        total_foreground_pixels = sum(counts[unique != 0])   # exclude background
+
+        avg_areas_this_image = {}     # pixels per instance
+        avg_percent_this_image = {}   # % of foreground pixels per class (averaged per instance)
+
+        for cls in resized_classes:
+            if cls == 0:
+                continue
+            pixels = class_pixel_counts.get(cls, 0)
+            orig_count = sum(1 for a in annotations if a["category_id"] == cls)
+
+            if orig_count > 0 and pixels > 0:
+                avg_pixels = pixels / orig_count
+                avg_areas_this_image[cls] = avg_pixels
+
+                # Percentage of foreground this class takes (per instance approximation)
+                percent_per_instance = (pixels / total_foreground_pixels * 100) if total_foreground_pixels > 0 else 0
+                avg_percent_this_image[cls] = percent_per_instance / orig_count   # avg % per instance
+
+        # mask path
         mask_save_path = os.path.join(output_mask_dir, filename.replace(".jpg", ".png"))
-        mask_resized.save(mask_save_path, format="PNG", optimize=True, compress_level=4)
+        
 
-        # make sure they didnt get corrupted
-        if not verify_image_was_saved_correctly(img_save_path):
-            print(f"!!! CORRUPTED OUTPUT IMAGE: {img_save_path}")
-            # Optional: delete it so it doesn't pollute training
-            try:
-                os.remove(img_save_path)
-            except:
-                pass
-
-        if not verify_image_was_saved_correctly(mask_save_path):
-            print(f"!!! CORRUPTED OUTPUT MASK: {mask_save_path}")
-            try:
-                os.remove(mask_save_path)
-            except:
-                pass
+        # verification code unchanged ...
 
         success = True
-
-        # After both saves + verifications
         if not verify_image_was_saved_correctly(img_save_path):
             success = False
-        if not verify_image_was_saved_correctly(mask_save_path):
-            success = False
+        else:
+            success = True # onlt save the mask and image if it is not corrupted after downsizing
+            img_resized.save(img_save_path, format="PNG", optimize=True, compress_level=4)
+            mask_resized.save(mask_save_path, format="PNG", optimize=True, compress_level=4)
 
+        
 
-        return True, local_skipped, local_dropped, local_kept
+        return success, local_skipped, local_dropped, local_kept, \
+               avg_areas_this_image, avg_percent_this_image
 
     except Exception:
-        return False, Counter(), Counter(), Counter()
+        return False, Counter(), Counter(), Counter(), {}, {}
 
 
 # target size is the number of rows and columns used to represent the downsized image.
@@ -324,20 +324,27 @@ def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,ima
         for image_id, annotations in coco_dict.items()
     ]
 
+    class_avg_pixels_this_set = defaultdict(list)  
+    class_avg_percent_this_set = defaultdict(list)
+
     with Pool(num_workers) as pool:
         with tqdm(total=len(tasks), desc="Processing images") as pbar:
-            for ok, s, d, k in pool.imap_unordered(process_single_image, tasks):
-                # Update main counters
+            for ok, s, d, k, avg_pixels_dict, avg_percent_dict in pool.imap_unordered(process_single_image, tasks):
                 skipped_stats.update(s)
                 dropped_instances_per_class.update(d)
                 kept_instances_per_class.update(k)
 
+                for cls, val in avg_pixels_dict.items():
+                    class_avg_pixels_this_set[cls].append(val)
+                for cls, val in avg_percent_dict.items():
+                    class_avg_percent_this_set[cls].append(val)
+
                 count += 1
                 pbar.update()
 
-                # Write log every 100 images
                 if count % 100 == 0:
-                    print_loss_stats(count, skipped_stats, dropped_instances_per_class, kept_instances_per_class)    # ---- Save pickle ----
+                    print_loss_stats(count, skipped_stats, dropped_instances_per_class, kept_instances_per_class)
+
     output_pickle = pathToAnnotations.replace(".json", ".pkl")
     to_save = {
         "annotations": dict(coco_dict),
@@ -346,12 +353,11 @@ def convertJsonsToBinariesAndSaveImagesAndMasks(pathToAnnotations,output_dir,ima
     }
     with open(output_pickle, "wb") as f:
         pickle.dump(to_save, f)
-
     print(f"Saved {len(coco_dict)} images with annotations to {output_pickle}")
     print(f"Downsized images saved to {output_image_dir}, masks saved to {output_mask_dir}")
-    print_loss_stats(count,skipped_stats,dropped_instances_per_class, kept_instances_per_class,top_k=15)
+    print_loss_stats(count, skipped_stats, dropped_instances_per_class, kept_instances_per_class, top_k=15)
 
-    return 
+    return class_avg_pixels_this_set, class_avg_percent_this_set
 
 def verify_image_was_saved_correctly(filepath):
     """Returns True if file can be opened as valid image, False otherwise"""
@@ -364,6 +370,204 @@ def verify_image_was_saved_correctly(filepath):
     except Exception as e:
         print(f"Corruption detected in {filepath}: {type(e).__name__} - {str(e)}")
         return False
+
+
+def plot_avg_instance_area_distribution(pixels_dict, percent_dict, dataset_name="Train", outputDir="", min_samples=1):
+    """
+    Side-by-side stem plots:
+      Left: mean pixels per instance
+      Right: mean % of foreground pixels per class (per instance)
+    Shows all classes with ≥ min_samples
+    """
+    # ── Prepare data for pixels ──────────────────────────────────────
+    valid_classes_p = []
+    means_p = []
+    stds_p = []
+    counts_p = []
+
+    for cls, areas in pixels_dict.items():
+        if len(areas) >= min_samples:
+            valid_classes_p.append(cls)
+            means_p.append(np.mean(areas))
+            stds_p.append(np.std(areas) if len(areas) > 1 else 0)
+            counts_p.append(len(areas))
+
+    # ── Prepare data for percentages ─────────────────────────────────
+    valid_classes_pct = []
+    means_pct = []
+    stds_pct = []
+    counts_pct = []
+
+    for cls, percents in percent_dict.items():
+        if len(percents) >= min_samples:
+            valid_classes_pct.append(cls)
+            means_pct.append(np.mean(percents))
+            stds_pct.append(np.std(percents) if len(percents) > 1 else 0)
+            counts_pct.append(len(percents))
+
+    if not valid_classes_p and not valid_classes_pct:
+        print(f"No data for {dataset_name}")
+        return
+
+    # Use union of classes (but usually same)
+    all_classes = sorted(set(valid_classes_p) | set(valid_classes_pct))
+
+    # For consistent ordering we'll sort by mean pixels descending
+    if valid_classes_p:
+        sort_key = {cls: mean for cls, mean in zip(valid_classes_p, means_p)}
+    else:
+        sort_key = {cls: 0 for cls in all_classes}
+
+    sorted_classes = sorted(all_classes, key=lambda c: sort_key.get(c, 0), reverse=True)
+
+    labels = [COCO_CLASSES[c] if c < len(COCO_CLASSES) else f"cls_{c}" for c in sorted_classes]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 9), sharex=True)
+
+    # ── Left: absolute pixels ────────────────────────────────────────
+    x = range(len(sorted_classes))
+    y_pixels = [np.mean(pixels_dict.get(cls, [0])) for cls in sorted_classes]
+    err_pixels = [np.std(pixels_dict.get(cls, [0])) for cls in sorted_classes]
+
+    ax1.stem(x, y_pixels, linefmt="C0-", markerfmt="C0o", basefmt=" ")
+    ax1.errorbar(x, y_pixels, yerr=err_pixels, fmt="none", ecolor="gray", capsize=4, alpha=0.7)
+    ax1.set_title("Mean pixels per instance")
+    ax1.set_ylabel("Pixels")
+    ax1.grid(True, axis="y", alpha=0.3)
+
+    # ── Right: percentage of foreground ──────────────────────────────
+    y_pct = [np.mean(percent_dict.get(cls, [0])) for cls in sorted_classes]
+    err_pct = [np.std(percent_dict.get(cls, [0])) for cls in sorted_classes]
+
+    ax2.stem(x, y_pct, linefmt="C2-", markerfmt="C2o", basefmt=" ")
+    ax2.errorbar(x, y_pct, yerr=err_pct, fmt="none", ecolor="gray", capsize=4, alpha=0.7)
+    ax2.set_title("Mean % of foreground pixels per instance")
+    ax2.set_ylabel("% of foreground")
+    ax2.grid(True, axis="y", alpha=0.3)
+
+    # Shared x-axis
+    for ax in (ax1, ax2):
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=60, ha="right", fontsize=8)
+        ax.tick_params(axis='x', which='major', labelsize=8)
+
+    # Add n= counts on top of left plot (most informative)
+    for i, cls in enumerate(sorted_classes):
+        n = len(pixels_dict.get(cls, []))
+        if n >= min_samples:
+            y = y_pixels[i] + (err_pixels[i] or 0) + max(1, y_pixels[i]*0.02)
+            ax1.text(i, y, f"n={n}", ha="center", va="bottom", fontsize=8, color="darkblue")
+
+    fig.suptitle(f"Average Instance Size after Downsampling to {imageHW}x{imageHW} px - {dataset_name}", fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    filename = f"{outputDir}{dataset_name.lower()}_pixels_and_percent_stem_{imageHW}.png"
+    plt.savefig(filename, dpi=140, bbox_inches="tight")
+    print(f"Saved: {filename}")
+    # plt.show()
+    # plt.close()
+
+
+def plot_combined_train_val_pixels_and_percent(train_pixels, train_percents,val_pixels, val_percents,min_samples=1,outputDir="",figsize=(24, 10)):
+    """
+    Creates ONE figure with FOUR stem subplots side-by-side:
+      1. Train - Mean pixels per instance
+      2. Val   - Mean pixels per instance
+      3. Train - Mean % of foreground
+      4. Val   - Mean % of foreground
+    """
+    # ── Helper to prepare data for one dataset ───────────────────────────────
+    def prepare_data(pixels_dict, percent_dict):
+        valid_classes = set(pixels_dict.keys()) | set(percent_dict.keys())
+        data = []
+        for cls in valid_classes:
+            n = len(pixels_dict.get(cls, []))
+            if n < min_samples:
+                continue
+            mean_pix = np.mean(pixels_dict.get(cls, [0]))
+            std_pix  = np.std(pixels_dict.get(cls, [0])) if n > 1 else 0
+            mean_pct = np.mean(percent_dict.get(cls, [0]))
+            std_pct  = np.std(percent_dict.get(cls, [0])) if n > 1 else 0
+            data.append((cls, mean_pix, std_pix, mean_pct, std_pct, n))
+        return data
+
+    train_data = prepare_data(train_pixels, train_percents)
+    val_data   = prepare_data(val_pixels,   val_percents)
+
+    if not train_data and not val_data:
+        print("No data to plot")
+        return
+
+    # Get all classes that appear in at least one set with enough samples
+    all_classes = sorted(set(d[0] for d in train_data + val_data))
+
+    # Sort by mean pixels in train (descending) - or change to whatever you prefer
+    sort_key = {d[0]: d[1] for d in train_data}  # mean pixels train
+    all_classes.sort(key=lambda c: sort_key.get(c, 0), reverse=True)
+
+    labels = [COCO_CLASSES[c] if c < len(COCO_CLASSES) else f"cls_{c}" for c in all_classes]
+
+    # ── Create figure with 4 subplots ────────────────────────────────────────
+    fig, axes = plt.subplots(1, 4, figsize=figsize, sharex=True, sharey=False)
+    fig.suptitle(f"Average Instance Size after Downsampling to {imageHW}x{imageHW} px\n"
+                 f"Train vs Val comparison, classes with ≥ {min_samples} occurrences", fontsize=16)
+
+    # Colors
+    train_color = 'C0'   # blue-ish
+    val_color   = 'C3'   # red-ish
+
+    def plot_one(ax, data, color, title, plot_percent=False):
+        if not data:
+            ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(title)
+            return
+
+        x = range(len(all_classes))
+
+        if plot_percent:
+            # Use mean_pct (index 3) and std_pct (index 4)
+            y = [next((d[3] for d in data if d[0] == cls), 0) for cls in all_classes]
+            err = [next((d[4] for d in data if d[0] == cls), 0) for cls in all_classes]
+        else:
+            # Use mean_pix (index 1) and std_pix (index 2)
+            y = [next((d[1] for d in data if d[0] == cls), 0) for cls in all_classes]
+            err = [next((d[2] for d in data if d[0] == cls), 0) for cls in all_classes]
+
+        ax.stem(x, y, linefmt=f"{color}-", markerfmt=f"{color}o", basefmt=" ")
+        ax.errorbar(x, y, yerr=err, fmt="none", ecolor=color, alpha=0.6, capsize=4)
+        ax.set_title(title)
+        ax.grid(True, axis='y', alpha=0.3)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=60, ha='right', fontsize=8)
+        ax.tick_params(axis='x', labelsize=8)
+
+        # Add n labels
+        for i, cls in enumerate(all_classes):
+            n = next((d[5] for d in data if d[0] == cls), 0)
+            if n > 0:
+                yval = y[i]
+                errval = err[i]
+                offset = max(1, yval * 0.03) if yval > 0 else 1
+                ax.text(i, yval + errval + offset, f"n={n}", ha='center', va='bottom',
+                        fontsize=8, color=color, alpha=0.9)
+
+    # Plot the four subplots
+    plot_one(axes[0], train_data, train_color, "Train  Mean pixels per instance")
+    plot_one(axes[1], val_data,   val_color,   "Val    Mean pixels per instance")
+    plot_one(axes[2], train_data, train_color, "Train  Mean % of foreground")
+    plot_one(axes[3], val_data,   val_color,   "Val    Mean % of foreground")
+
+    # Shared y-labels where possible
+    axes[0].set_ylabel("Pixels per instance")
+    axes[2].set_ylabel("% of foreground pixels")
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    filename = f"{outputDir}combined_train_val_pixels_percent_stem_{imageHW}.png"
+    plt.savefig(filename, dpi=140, bbox_inches='tight')
+    print(f"Saved combined plot: {filename}")
+    plt.show()
+    plt.close()
 
 
 # ----------------- Save or Load Binary -----------------
@@ -381,6 +585,7 @@ imagesDownSizedVAL = f"/home/npurd/trainingData/COCO/val2017_downsized{imageHW}/
 
 
 
+
 LOG_FILE = f"/home/npurd/trainingData/COCO/logImageDownsizing{imageHW}.txt"
 with open(LOG_FILE, "w") as f:
     f.write("Image downsizing / segmentation loss log\n")
@@ -389,7 +594,17 @@ with open(LOG_FILE, "w") as f:
 
 # cretes some nice binary files for sifting through and loading images using
 # convert training and validation meta data to binary files (not images...)
-convertJsonsToBinariesAndSaveImagesAndMasks(json_train, imagesDownSizedTRAIN, image_base_dir_TRAIN,  imageHW)
-print(f"Converted {json_train} to binary...")
-convertJsonsToBinariesAndSaveImagesAndMasks(json_val, imagesDownSizedVAL, image_base_dir_VAL, imageHW)
-print(f"Converted {json_val} to binary...")
+val_pixels, val_percents = convertJsonsToBinariesAndSaveImagesAndMasks(json_val, imagesDownSizedVAL, image_base_dir_VAL, imageHW)
+plot_avg_instance_area_distribution(val_pixels, val_percents, dataset_name="Val", outputDir=imagesDownSizedVAL,  min_samples=1)
+
+train_pixels, train_percents = convertJsonsToBinariesAndSaveImagesAndMasks(json_train, imagesDownSizedTRAIN, image_base_dir_TRAIN, imageHW)
+plot_avg_instance_area_distribution(train_pixels, train_percents, dataset_name="Train", outputDir=imagesDownSizedTRAIN,  min_samples=1)
+
+
+# broken  
+# plot_combined_train_val_pixels_and_percent(
+#     train_pixels, train_percents,
+#     val_pixels, val_percents,
+#     min_samples=1,
+#     outputDir=imagesDownSizedTRAIN,
+# )

@@ -305,94 +305,132 @@ class COCOSegmentationDataset(Dataset):
             return self.dummy_img.clone(), self.dummy_mask.clone(), f"SKIPPED_{filename}"
 
 
-# use this residul block class to add resnet to an existing CNN model
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels=None):
+    """Simple pre-activation residual block (you can replace with your own version)"""
+    def __init__(self, channels, kernel_size=3):
         super().__init__()
-        out_channels = out_channels or in_channels  # default same channels
-
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_channels)
-
-        # Shortcut for channel change
-        self.shortcut = nn.Sequential()
-        if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, bias=False),
-                nn.BatchNorm2d(out_channels)
-            )
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size,
+                               padding=kernel_size//2, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size,
+                               padding=kernel_size//2, bias=False)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        identity = self.shortcut(x)
-        out = torch.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += identity
-        out = torch.relu(out)
-        return out
+        identity = x
+        out = self.bn1(x)
+        out = self.relu(out)
+        out = self.conv1(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        return out + identity
 
 
-class CNNSegmentation(nn.Module):
-    def __init__(self, num_classes=81, base_channels=32, channelDepth=3, input_height=64, input_width=64):
+class RCNNSegmentation(nn.Module):
+    def __init__(
+        self,
+        num_classes=81,
+        input_channels=3,           # renamed from channelDepth for clarity
+        base_channels=32,
+        num_stages=3,               # ← NEW: how many down/up stages (was fixed at 3)
+        kernel_sizes=None,          # ← NEW: list of kernel sizes, one per stage
+        residual_blocks_per_stage=2,
+        input_height=64,
+        input_width=64,
+    ):
         super().__init__()
 
-        if input_height % 8 != 0 or input_width % 8 != 0:
-            raise ValueError(f"Input spatial size must be divisible by 8 (got {input_height}x{input_width})")
+        if kernel_sizes is None:
+            kernel_sizes = [3] * num_stages   # default: 3×3 everywhere
+        if len(kernel_sizes) != num_stages:
+            raise ValueError(f"kernel_sizes ({len(kernel_sizes)}) must match num_stages ({num_stages})")
+
+        # Check divisibility — now generalized for arbitrary num_stages
+        divisor = 2 ** num_stages
+        if input_height % divisor != 0 or input_width % divisor != 0:
+            raise ValueError(
+                f"Input size must be divisible by 2^{num_stages} = {divisor} "
+                f"(got {input_height}x{input_width})"
+            )
 
         self.expected_h = input_height
         self.expected_w = input_width
-        # rgb has channel depth of 3
-        c1 = base_channels          # 32 (making the RGB go from 3 to 32 channels gives the NN "more to use to learn" with regard to color)
-        c2 = c1 * 2                 # 64
-        c3 = c2 * 2                 # 128
 
-        self.encoder = nn.Sequential(
-            nn.Conv2d(channelDepth, c1, 3, padding=1, bias=False),
-            nn.BatchNorm2d(c1),
-            nn.ReLU(),
+        # Build channel list: [32, 64, 128, 256, ...]
+        channels = [base_channels * (2 ** i) for i in range(num_stages + 1)]
+        # channels[0] = first conv out   channels[1] = after stage 1, etc.
+        # channels[num_stages] = bottleneck
 
-            ResidualBlock(c1),
-            ResidualBlock(c1),
-            nn.MaxPool2d(2),          #  32x32
+        # ────────────────────────────────────────────────
+        #                   Encoder
+        # ────────────────────────────────────────────────
+        encoder_layers = []
 
-            nn.Conv2d(c1, c2, 1),
-            ResidualBlock(c2),
-            ResidualBlock(c2),
-            nn.MaxPool2d(2),          #  16x16
+        # First conv (from input channels → base_channels)
+        encoder_layers.extend([
+            nn.Conv2d(input_channels, channels[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.ReLU(inplace=True),
+        ])
 
-            nn.Conv2d(c2, c3, 1),
-            ResidualBlock(c3),
-            ResidualBlock(c3),
-            nn.MaxPool2d(2),          #  8x8
-        )
+        # Stages 1 to num_stages
+        for i in range(num_stages):
+            ch_in  = channels[i]
+            ch_out = channels[i+1]
+            k = kernel_sizes[i]
 
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(c3, c3, 2, stride=2),
-            nn.BatchNorm2d(c3),
-            nn.ReLU(),
-            ResidualBlock(c3),
+            # Residual blocks (same channels)
+            for _ in range(residual_blocks_per_stage):
+                encoder_layers.append(ResidualBlock(ch_in, kernel_size=k))
 
-            nn.ConvTranspose2d(c3, c2, 2, stride=2),
-            nn.BatchNorm2d(c2),
-            nn.ReLU(),
-            ResidualBlock(c2),
+            # Transition to next channel count (1×1 conv when channels change)
+            if ch_in != ch_out:
+                encoder_layers.append(nn.Conv2d(ch_in, ch_out, 1, bias=False))
+                encoder_layers.append(nn.BatchNorm2d(ch_out))
+                encoder_layers.append(nn.ReLU(inplace=True))
 
-            nn.ConvTranspose2d(c2, c1, 2, stride=2),
-            nn.BatchNorm2d(c1),
-            nn.ReLU(),
+            # Downsample (except after last stage)
+            if i < num_stages - 1:
+                encoder_layers.append(nn.MaxPool2d(2))
 
-            nn.Conv2d(c1, num_classes, 1)
-        )
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        # ────────────────────────────────────────────────
+        #                   Decoder
+        # ────────────────────────────────────────────────
+        decoder_layers = []
+
+        current_ch = channels[-1]   # bottleneck
+
+        # Upsample only num_stages-1 times (match the number of actual downsamples)
+        for i in reversed(range(num_stages - 1)):  # i = 1,0 for num_stages=3
+            next_ch = channels[i]
+
+            decoder_layers.extend([
+                nn.ConvTranspose2d(current_ch, next_ch, kernel_size=2, stride=2),
+                nn.BatchNorm2d(next_ch),
+                nn.ReLU(inplace=True),
+            ])
+
+            # Residual blocks at this resolution
+            for _ in range(residual_blocks_per_stage):
+                decoder_layers.append(ResidualBlock(next_ch, kernel_size=kernel_sizes[i]))
+
+            current_ch = next_ch
+
+        # Final 1×1 → classes (no more upsampling)
+        decoder_layers.append(nn.Conv2d(current_ch, num_classes, kernel_size=1))
+
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x):
         if x.shape[2] != self.expected_h or x.shape[3] != self.expected_w:
             raise RuntimeError(
-                f"Expected input shape ...x{self.expected_h}x{self.expected_w}, "
-                f"got {x.shape}"
+                f"Expected ...x{self.expected_h}x{self.expected_w}, got {x.shape}"
             )
         return self.decoder(self.encoder(x))
-
 #  Function to visualize a few images with masks (minor tweaks for torch tensors)
 # Function to visualize a few images with masks
 def show_images_with_masks(dataset, BASE_COLORS, n=5):
@@ -776,12 +814,14 @@ def plotTrainingResults(history, output_folder):
     plt.show()
     # Drop per-class confusion (not relevant for segmentation)
 # plot more class specific training history
-def plot_per_class_iou_progress(output_folder, max_classes=12,sortLargeToSmall=True):
+def plot_per_class_iou_progress(output_folder, fileName="",max_classes=12,sortLargeToSmall=True):
     import pickle
     import matplotlib.pyplot as plt
     import os
 
     pkl_path = os.path.join(output_folder, "per_class_iou_val_per_epoch.pkl")
+
+    
     if not os.path.exists(pkl_path):
         print("No per-class history found.")
         return
@@ -822,11 +862,11 @@ def plot_per_class_iou_progress(output_folder, max_classes=12,sortLargeToSmall=T
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    save_fig = os.path.join(output_folder, "per_class_iou_progress.png")
-    plt.savefig(save_fig, dpi=140, bbox_inches="tight")
+    save_fig_path = os.path.join(output_folder, f"{fileName}.png")
+    plt.savefig(save_fig_path, dpi=140, bbox_inches="tight")
     plt.show()
 
-    print(f"Saved plot: {save_fig}")
+    print(f"Saved plot: {save_fig_path}")
 
 def plot_per_class_ap_progress(output_folder, max_classes=12, sortLargeToSmall=True):
     import pickle
@@ -879,7 +919,7 @@ def plot_per_class_ap_progress(output_folder, max_classes=12, sortLargeToSmall=T
 
 #heatmap output of CNN decoder
 def save_per_class_heatmaps(probs, images, filenames, save_dir, epoch=None, alpha=0.5,
-                           min_prob_threshold=0.15, colormap='turbo', vis_threshold=0.10):
+                           min_prob_threshold=0.3, colormap='turbo', vis_threshold=0.10):
     """
     Saves a three-panel figure per class:
     - Left: original image
@@ -953,7 +993,7 @@ def save_per_class_heatmaps(probs, images, filenames, save_dir, epoch=None, alph
             ax_blend = fig.add_axes([0.70, 0.15, W/(W*3 + 400), 0.72])
             ax_blend.imshow(blended)
             ax_blend.axis('off')
-            ax_blend.set_title(f"Overlay (max: {max_p:.3f})", fontsize=8)
+            ax_blend.set_title(f"Overlay (max: {max_p:.3f}) w/ {min_prob_threshold} thresh", fontsize=6)
 
             # Colorbar (far right, aligned with the panels)
             ax_cbar = fig.add_axes([0.935, 0.15, 0.018, 0.72])
@@ -1162,9 +1202,9 @@ FileList_train = os.listdir(imageFolderTrain)
 FileList_val = os.listdir(imageFolderVal)
 
 # High level run control
-num_epochs = 300
-batch_size = 256 # sort of function of input image size, if 64x64 or less, do >128, if 256x256, do < 16 (exponential relationship)
-learningRate = np.round(batch_size*0.000009, 6) # learning rate should be some rough function of batch size (in general, not speciifically for this NN)
+num_epochs = 150
+batch_size = 128 # sort of function of input image size, if 64x64 or less, do >128, if 256x256, do < 16 (exponential relationship)
+learningRate = np.round(batch_size*0.00009, 6) # learning rate should be some rough function of batch size (in general, not speciifically for this NN)
 augmentData = True # probably not needed for coco, we shall see (dont augment the validation data!)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using {device}")
@@ -1181,13 +1221,21 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_w
 
 
 # Set up the model ()
-model = CNNSegmentation(num_classes=81, base_channels=32, channelDepth=3, input_height=imageHeightWidth, input_width=imageHeightWidth) 
+model = RCNNSegmentation(
+    num_classes=81,
+    input_channels=3,
+    base_channels=32,
+    num_stages=3,
+    kernel_sizes=[5, 3, 1],
+    input_height=64,
+    input_width=64
+)
 model = model.to(device)
 criterion = nn.CrossEntropyLoss(ignore_index=0) # ignore background class 0
 optimizer = torch.optim.Adam(model.parameters(), lr=learningRate)
 scheduler = CosineAnnealingLR(optimizer,T_max=num_epochs,eta_min=1e-6,last_epoch=-1) # scheduler will change arressiveness depending on number of epochs planned on training
 testName = model.__class__.__name__
-outputFolder = f"testResults_{testName}{num_epochs}"
+outputFolder = f"testResults_{testName}{num_epochs}_{imageHeightWidth}x{imageHeightWidth}"
 os.makedirs(outputFolder, exist_ok=True)
 # save meta data so i can correspond output performance of DOE studies to inputs... (for mass analysis comparison)
 save_training_setup(outputFolder, model, optimizer, scheduler, train_dataset, val_dataset)
@@ -1197,9 +1245,9 @@ history = trainCOCOCNN(model, num_epochs, train_loader, val_loader, optimizer, s
 # dry_run_dataloader(train_loader, val_loader=None, max_batches=None)
 # plot the results i guess
 plotTrainingResults(history, outputFolder)
-plot_per_class_iou_progress(outputFolder, max_classes=10, sortLargeToSmall=True) # show miou history for 10 best classes
-plot_per_class_iou_progress(outputFolder, max_classes=10,sortLargeToSmall=False)  # show miuo histoyr for worst wlasses
-plot_per_class_ap_progress(outputFolder, max_classes=10, sortLargeToSmall=True) # show MAP history
-plot_per_class_ap_progress(outputFolder, max_classes=10, sortLargeToSmall=False)
+plot_per_class_iou_progress(outputFolder, fileName="per_class_iou_progress_best", max_classes=10, sortLargeToSmall=True) # show miou history for 10 best classes
+plot_per_class_iou_progress(outputFolder,fileName="per_class_iou_progress_worst", max_classes=10,sortLargeToSmall=False)  # show miuo histoyr for worst wlasses
+# plot_per_class_ap_progress(outputFolder, max_classes=10, sortLargeToSmall=True) # show MAP history
+# plot_per_class_ap_progress(outputFolder, max_classes=10, sortLargeToSmall=False)
 # save some predictions so we see what the heck the model is thinking (first batch of validation images)
 predict_and_save_overlays(model=model,dataloader=val_loader,save_dir=os.path.join(outputFolder, "val_per_class_heatmaps"),device=device,max_batches=1,epoch=1)
