@@ -9,6 +9,8 @@ import os
 from tqdm import tqdm
 import math as math
 import cv2
+import sys
+from matplotlib.patches import Circle
 pie = math.pi # for convenience
 
 """
@@ -91,7 +93,7 @@ def genSuppressionMask(H, W, gradMags, gradAngs):
 
 
 
-def houghCircleTranform(edgeMap, height, width):
+def houghCircleTranform(edgeMap, height, width, Rmax, Rmin):
 
     # perform the hough transform here, using x-y coordinates
     # apparently this is a brute force method and not practical, but polar coordinates (wikipedia) is much quicker, so i might try that 
@@ -102,21 +104,21 @@ def houghCircleTranform(edgeMap, height, width):
     a_max = height
     b_min = 0
     a_min = 0
-    radiusMin = 1 
-    radiusMax = 3 # make less than image size   
+    radiusMin = Rmin 
+    radiusMax = Rmax # make less than image size   
     # inc values
     da = 1
     db = 1
     dR = 1
     # define the search arrays
-    R_values = np.arange(radiusMin,radiusMax, dR)
+    R_values = np.arange(radiusMin,radiusMax+1, dR)
     a_values = np.arange(a_min,a_max, da)
     b_values = np.arange(b_min,b_max, db)
-    print(a_values)
+    # print(a_values)
     # preallocate hough transform result vector
     houghCounter = np.zeros((height, width, len(R_values)), dtype=np.int32)
     # now do the loop thing
-    for row, col in edgeMap:
+    for row, col in tqdm(edgeMap, desc="Processing edge pixels", unit="px"):
         for r_idx, r in enumerate(R_values):
             for a in a_values:
                 for b in b_values:
@@ -126,20 +128,60 @@ def houghCircleTranform(edgeMap, height, width):
 
     return houghCounter, R_values
 
+def houghCircleTranform_vectorized(edgeMap, height, width, Rmax, Rmin,radiusThreshold):
+    """
+    Vectorized brute-force version 
+    """
+    da = db = dR = 1
+    R_values = np.arange(Rmin, Rmax + 1, dR)
+    nr = len(R_values)
 
+    a_grid = np.arange(0, height, da)          # shape (height,)
+    b_grid = np.arange(0, width, db)           # shape (width,)
+
+    # Meshgrid of ALL possible centers (y,x)
+    A, B = np.meshgrid(a_grid, b_grid, indexing='ij')  # A=rows, B=cols
+
+    houghCounter = np.zeros((height, width, nr), dtype=np.int32)
+
+    for ey, ex in tqdm(edgeMap, desc="Processing edge pixels", unit="px"):
+        # Distance from this pixel to EVERY center
+        dist = np.sqrt((ey - A)**2 + (ex - B)**2)   # shape (height, width)
+
+        for r_idx, r in enumerate(R_values):
+            mask = np.abs(dist - r) <= radiusThreshold
+            houghCounter[:, :, r_idx] += mask.astype(np.int32)
+
+    return houghCounter, R_values
+
+# def overlayCircles():
 
 
 
 ##### part 1
 # load in the provided homework image
-fullPath = "hw3edges1.png"
-image = Image.open(fullPath).convert("L") # it is black and white
+imageFile = sys.argv[1]  # user inpout the image...
+
+# decide what do do based on the imaige you are loading in, to follow the hw flow
+if imageFile == "hw3edges1.png":
+    Rmax = 3
+    Rmin = 1
+    threshold = 0.5 # there is only one pixel in this example, so all  other circle drawing pixel locations will have a max of one single vote
+    radiusThreshold = 0.5
+elif imageFile == "hw3edges2.png":
+    Rmax = 5
+    Rmin = 1
+    threshold = 3
+    radiusThreshold = 0.5
+elif imageFile == "hw3edges3.png":
+    Rmax = 20
+    Rmin = 8
+    threshold = 70
+    radiusThreshold = 1
+image = Image.open(imageFile).convert("L") # it is black and white
+original = image # make a copy for later
 numCols, numRows = image.size
 
-# plot the steps of the image processing
-fig, axes = plt.subplots(1, 5, figsize=(10, 5))
-axes[0].imshow(image, cmap='gray')
-axes[0].set_title("Input Image")
 
 
 ################################### dont perform this edge detection first. the  images provided in the hw "are already an edge map..."
@@ -163,44 +205,101 @@ axes[0].set_title("Input Image")
 # define the parameters of searching during the hough tansform first for clarity
 image = np.array(image)
 edgePixels = np.argwhere(image > 0) # returns x,y list of the edge pixels in the image
-print(edgePixels)
+# print(edgePixels)
 height, width = image.shape # output inage will be same shape as input image probably
 # now we need to store the results of the transfor, and for circles, its 3 parameters (x center, y center, and the radius)
-houghCounter, searchRadiusValues = houghCircleTranform(edgePixels, height, width)
+houghCounter, searchRadiusValues = houghCircleTranform_vectorized(edgePixels, height, width, Rmax, Rmin, radiusThreshold)
 
 
 
-max_votes = houghCounter.max()
-if max_votes > 0:
-    # Find all positions with max_votes
-    positions = np.argwhere(houghCounter == max_votes)
-    # positions is array of [x, y, r_idx]
+# now print the values for testing radius = 1,2,3
+print("Accumulator slices for each radius:")
+for r_idx, r in enumerate(searchRadiusValues):
+    slice_2d = houghCounter[:, :, r_idx]
+    print(f"\nRadius = {r:.1f}  (index {r_idx}, max votes in slice = {slice_2d.max()})")
+    print(slice_2d)
+
+
+
+# use local 3x3x3 neighborhood for thresholding
+# threshold = max(1, int(houghCounter.max() * 0.25))
+# Create mask for interior only (exclude 1-pixel border in all 3 dims)
+interior_mask = np.zeros(houghCounter.shape, dtype=bool)
+interior_mask[1:-1, 1:-1, 1:-1] = True # 3x3x3 mask of interior
+local_max = (houghCounter == ndimage.maximum_filter(houghCounter, size=3)) & (houghCounter >= threshold)
+peak_coords = np.argwhere(local_max)
+print(f"\nLocal maxima (3x3x3 neighborhood, value ≥ {threshold}): {len(peak_coords)} found")
+for i, (a, b, ridx) in enumerate(peak_coords):
+    votes = houghCounter[a, b, ridx]
+    r_val = searchRadiusValues[ridx]
+    print(f"  #{i+1:3d} :  y={a:4d}, x={b:4d}, r={r_val:.1f} --> {votes} votes")
+
+N = 100 # this is higher than will show, given the threshold is small enough.... only makes sense on images with actual circle shapes, not single pixels
+if len(peak_coords) > 0:
+    # Get indices sorted by vote descending
+    sorted_idx = np.argsort([-houghCounter[tuple(p)] for p in peak_coords])
+    top_peaks = peak_coords[sorted_idx[:N]]
     
-    # use the mean of the points to determine the cnetroid of all the circles
-    cent_x = np.mean(positions[:, 0])
-    cent_y = np.mean(positions[:, 1])
-    cent_r_idx = np.mean(positions[:, 2])  
-    
-    best_x = cent_x
-    best_y = cent_y
-    best_r = searchRadiusValues[int(round(cent_r_idx))]
-    
-    print(f"Centroid at (x={best_x:.2f}, y={best_y:.2f}), r={best_r}, based on {len(positions)} tied positions")
+    print(f"\nTop {min(N, len(peak_coords))} strongest local maxima:")
+    for i, (a, b, ridx) in enumerate(top_peaks, 1):
+        votes = houghCounter[a, b, ridx]
+        r = searchRadiusValues[ridx]
+        print(f"  #{i:2d} : y={a:4d}, x={b:4d}, r={r:.1f} → {votes} votes")
 
-# now print the values for testing radius = 1
-r1_idx = np.where(searchRadiusValues == 1)[0]
-if len(r1_idx) == 1:
-    r1_idx = r1_idx[0]
-    print("\nHough votes for radius = 1 (slice shape:", houghCounter[:, :, r1_idx].shape, ")")
-    print(houghCounter[:, :, r1_idx])
-else:
-    print("Radius 1 not found in searchRadiusValues")
 
-fig2, ax2 = plt.subplots(figsize=(6,6))
-r1_idx = np.where(searchRadiusValues == 1)[0][0]
-ax2.imshow(houghCounter[:, :, r1_idx], cmap='hot')
-ax2.set_title("Hough accumulator - radius = 1\n(brighter = more votes)")
-ax2.set_xlabel("column (b)")
-ax2.set_ylabel("row (a)")
-plt.colorbar(ax2.imshow(houghCounter[:, :, r1_idx], cmap='hot'), ax=ax2, label='Vote count')
+# overlay circles on the original imaige
+fig_overlay, ax_overlay = plt.subplots(figsize=(10, 10))
+ax_overlay.imshow(original, cmap='gray')
+ax_overlay.set_title("Detected circles overlaid on original image")
+ax_overlay.set_aspect('equal')
+
+# How many of the top peaks to draw
+N_draw = len(top_peaks)
+
+for i in range(N_draw):
+    y, x, ridx = top_peaks[i]           # y=row, x=col
+    r = searchRadiusValues[ridx]
+    votes = houghCounter[y, x, ridx]
+
+    # Style: strongest → thick red, others → cyan dashed
+    if i == 0:
+        color = 'red'
+        lw = 3.2
+        alpha = 0.95
+        ls = '-'
+    else:
+        color = 'cyan'
+        lw = 1.6
+        alpha = 0.65
+        ls = '--'
+
+    circ = Circle(
+        (x, y),           # center = (column, row)
+        r,
+        edgecolor=color,
+        facecolor='none',
+        linewidth=lw,
+        alpha=alpha,
+        linestyle=ls
+    )
+    ax_overlay.add_patch(circ)
+
+    # Small label with vote count
+    ax_overlay.text(
+        x + r + 8,
+        y,
+        f"{votes}",
+        color='yellow',
+        fontsize=10,
+        va='center',
+        bbox=dict(facecolor='black', alpha=0.45, edgecolor='none', pad=1.8)
+    )
+
+ax_overlay.axis('off')
+plt.tight_layout()
+plt.savefig(f"{imageFile.split(".")[0]}_overlay.png", dpi=150, bbox_inches='tight')
 plt.show()
+
+
+
+
